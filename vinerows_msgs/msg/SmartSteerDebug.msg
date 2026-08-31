@@ -1,0 +1,13 @@
+std_msgs/Header header
+float64 x_m
+float64 y_m
+float64 theta_rad
+float64 v_mps
+float64 v_slip_lat_mps
+float64 v_slip_rot_radps
+float64 imu_wz_bias_radps
+float64 md
+float64 y_ref_m
+float64 theta_ref_rad
+bool outlier_detected_b
+bool estimate_valid_b

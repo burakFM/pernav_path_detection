@@ -1,0 +1,16 @@
+std_msgs/Header header
+bool estimate_valid_b
+float64 x_m_kf
+float64 y_m_kf
+float64 theta_rad_kf
+float64 v_mps_kf
+float64 v_slip_lat_mps_kf
+bool hard_reset_b_kf
+bool soft_reset_b_kf
+bool smartsteer_active_b
+float64 y_error_m_ctrl
+float64 theta_error_rad_ctrl
+float64 y_m_perc
+float64 theta_rad_perc
+bool new_valid_perc_meas
+float64 jetson_time

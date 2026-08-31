@@ -1,0 +1,9 @@
+std_msgs/Header header
+float64 dbg_theta_ref_offset_rad
+float64 dbg_curvature_cmd_int_1pm
+float64 dbg_curvature_cmd_theta_1pm
+float64 dbg_curvature_cmd_1pm
+float64 dbg_spare1
+float64 dbg_spare2
+float64 dbg_spare3
+float64 dbg_spare4

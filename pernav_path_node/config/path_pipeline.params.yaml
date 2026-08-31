@@ -1,0 +1,106 @@
+path_pipeline_node:
+  ros__parameters:
+    # Input PointCloud2 topic name.
+    input_topic: /pcl_world_fov
+
+    # Rectangular FOV crop in lidar XY coordinates [m].
+    # Keep points with x in [fov_x_min, fov_x_max] and y in [fov_y_min, fov_y_max].
+    fov_x_min: 0.0
+    fov_x_max: 20.0
+    fov_y_min: -10.0
+    fov_y_max: 10.0
+
+    # Remove the tractor chassis region before row detection.
+    enable_chassis_exclusion: true
+    chassis_exclusion_x_min: 0.0
+    chassis_exclusion_x_max: 5.0
+    chassis_exclusion_y_min: -2.0
+    chassis_exclusion_y_max: 2.0
+
+    # Enable/disable row detection stage in callback.
+    enable_row_detection: true
+
+    # RANSAC inlier distance threshold to candidate row line [m].
+    row_distance_threshold: 0.25
+
+    # Maximum allowed gap along projected inlier sequence for one continuous row [m].
+    row_max_gap: 0.8
+
+    # Number of random RANSAC trials per row extraction cycle.
+    row_max_iterations: 400
+
+    # Minimum inliers required to accept a detected row segment.
+    row_min_segment_inliers: 40
+
+    # Max number of rows to extract from one frame.
+    row_max_rows: 8
+
+    # After one row is found, remove nearby points within this perpendicular distance [m].
+    row_remove_radius: 1.9
+
+    # Stop iterative extraction when remaining points are below this count.
+    row_min_points_left: 25
+
+    # Reference point [m] used to orient row start/end endpoints consistently.
+    row_start_ref_x: 3.0
+    row_start_ref_y: 0.0
+
+    # Enable/disable path construction from detected row pairs.
+    enable_path_detection: true
+
+    # Maximum allowed distance [m] between two row start points to form one path.
+    path_width: 3.8
+
+    # Remove paths shorter than this value [m].
+    min_path_length: 1.0
+
+    # Enable/disable group-based parallel correction of paths.
+    enable_parallel_correction: true
+
+    # Maximum orientation difference [deg] to connect two paths into a group.
+    group_angle_thresh_deg: 12.0
+
+    # Maximum midpoint distance [m] to connect two paths into a group.
+    group_midpoint_thresh: 8.0
+
+    # Maximum lateral gap [m] to connect two paths into a group.
+    group_lateral_thresh: 5.0
+
+    # Start-line extension [m] at both ends when fitting group start line.
+    start_line_extension_m: 2.0
+
+    # Enable/disable publishing path start poses as geometry_msgs/PoseArray.
+    enable_path_publisher: true
+
+    # Output topic for path start poses.
+    path_output_topic: /pernav/paths
+
+    # Retained for compatibility with older parameter files.
+    path_sensor_id: pernav_path_node
+
+    # Enable/disable RViz debug marker publishing for corrected paths.
+    enable_marker_publisher: true
+
+    # Output MarkerArray topic for path line visualization.
+    marker_output_topic: /pernav/path_markers
+
+    # LINE_STRIP width [m] for each path marker.
+    marker_line_width: 0.08
+
+    # Marker lifetime [s]. Keep this close to frame period for live updates.
+    marker_lifetime_sec: 0.2
+
+    # Enable/disable RViz marker publication for fitted group start lines.
+    enable_group_start_line_marker: true
+
+    # Enable/disable direct notebook-style matplotlib plotting inside the node.
+    enable_notebook_plot: false
+
+    # Plot only every Nth frame to reduce GUI load.
+    plot_every_n_frames: 10
+
+    # Live plot XY limits [m], similar to notebook fixed axes.
+    plot_x_min: 0.0
+    plot_x_max: 20.0
+    plot_y_min: -10.0
+    plot_y_max: 10.0
