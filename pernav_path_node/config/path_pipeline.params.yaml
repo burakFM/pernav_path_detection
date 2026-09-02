@@ -3,7 +3,12 @@ path_pipeline_node:
     # Input PointCloud2 topic name.
     input_topic: /pcl_world_fov
 
-    # Rectangular FOV crop in lidar XY coordinates [m].
+    # Optionally apply an additional rectangular crop to the input cloud.
+    # Keep this disabled when input_topic is already spatially filtered.
+    enable_rectangular_fov_filter: false
+
+    # Rectangular FOV crop in input-cloud XY coordinates [m].
+    # These limits are used only when enable_rectangular_fov_filter is true.
     # Keep points with x in [fov_x_min, fov_x_max] and y in [fov_y_min, fov_y_max].
     fov_x_min: 0.0
     fov_x_max: 20.0
@@ -11,7 +16,7 @@ path_pipeline_node:
     fov_y_max: 10.0
 
     # Remove the tractor chassis region before row detection.
-    enable_chassis_exclusion: true
+    enable_chassis_exclusion: false
     chassis_exclusion_x_min: 0.0
     chassis_exclusion_x_max: 5.0
     chassis_exclusion_y_min: -2.0
@@ -94,12 +99,18 @@ path_pipeline_node:
     enable_group_start_line_marker: true
 
     # Enable/disable direct notebook-style matplotlib plotting inside the node.
-    enable_notebook_plot: false
+    enable_notebook_plot: true
 
     # Plot only every Nth frame to reduce GUI load.
     plot_every_n_frames: 10
 
-    # Live plot XY limits [m], similar to notebook fixed axes.
+    # Automatically follow the incoming cloud's world-frame XY bounds.
+    enable_plot_autoscale: true
+
+    # Extra space [m] around the automatically calculated cloud bounds.
+    plot_padding_m: 2.0
+
+    # Fallback fixed limits [m], used when autoscaling is disabled or the cloud is empty.
     plot_x_min: 0.0
     plot_x_max: 20.0
     plot_y_min: -10.0

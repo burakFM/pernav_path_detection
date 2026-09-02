@@ -42,6 +42,7 @@ class PathPipelineNode(Node):
             namespace='',
             parameters=[
                 ('input_topic', '/pcl_world_fov'),
+                ('enable_rectangular_fov_filter', True),
                 ('fov_x_min', 0.0),
                 ('fov_x_max', 20.0),
                 ('fov_y_min', -10.0),
@@ -77,6 +78,8 @@ class PathPipelineNode(Node):
                 ('marker_lifetime_sec', 0.2),
                 ('enable_notebook_plot', False),
                 ('plot_every_n_frames', 1),
+                ('enable_plot_autoscale', False),
+                ('plot_padding_m', 1.0),
                 ('plot_x_min', 0.0),
                 ('plot_x_max', 20.0),
                 ('plot_y_min', -10.0),
@@ -87,6 +90,9 @@ class PathPipelineNode(Node):
         )
 
         self.input_topic = self.get_parameter('input_topic').value
+        self.enable_rectangular_fov_filter = bool(
+            self.get_parameter('enable_rectangular_fov_filter').value
+        )
         self.fov_x_min = float(self.get_parameter('fov_x_min').value)
         self.fov_x_max = float(self.get_parameter('fov_x_max').value)
         self.fov_y_min = float(self.get_parameter('fov_y_min').value)
@@ -122,6 +128,8 @@ class PathPipelineNode(Node):
         self.marker_lifetime_sec = float(self.get_parameter('marker_lifetime_sec').value)
         self.enable_notebook_plot = bool(self.get_parameter('enable_notebook_plot').value)
         self.plot_every_n_frames = max(1, int(self.get_parameter('plot_every_n_frames').value))
+        self.enable_plot_autoscale = bool(self.get_parameter('enable_plot_autoscale').value)
+        self.plot_padding_m = max(0.0, float(self.get_parameter('plot_padding_m').value))
         self.plot_x_min = float(self.get_parameter('plot_x_min').value)
         self.plot_x_max = float(self.get_parameter('plot_x_max').value)
         self.plot_y_min = float(self.get_parameter('plot_y_min').value)
@@ -148,6 +156,7 @@ class PathPipelineNode(Node):
         self.subscription
         self.get_logger().info(
             f'Path pipeline node listening on topic {self.input_topic} '
+            f'| rectangular_fov_filter={self.enable_rectangular_fov_filter} '
             f'| FOV x:[{self.fov_x_min}, {self.fov_x_max}] '
             f'y:[{self.fov_y_min}, {self.fov_y_max}] '
             f'| row_detection={self.enable_row_detection} '
@@ -156,6 +165,7 @@ class PathPipelineNode(Node):
             f'| path_pub={self.enable_path_publisher} ({self.path_output_topic}) '
             f'| marker_pub={self.enable_marker_publisher} ({self.marker_output_topic}) '
             f'| notebook_plot={self.enable_notebook_plot} '
+            f'| plot_autoscale={self.enable_plot_autoscale} '
             f'| group_start_line_marker={self.enable_group_start_line_marker}'
         )
 
@@ -224,8 +234,17 @@ class PathPipelineNode(Node):
                 alpha=0.9,
             )
 
-        ax.set_xlim(self.plot_x_min, self.plot_x_max)
-        ax.set_ylim(self.plot_y_min, self.plot_y_max)
+        if self.enable_plot_autoscale and xy_fov.size > 0:
+            x_min = float(np.min(xy_fov[:, 0]))
+            x_max = float(np.max(xy_fov[:, 0]))
+            y_min = float(np.min(xy_fov[:, 1]))
+            y_max = float(np.max(xy_fov[:, 1]))
+            padding = max(0.1, self.plot_padding_m)
+            ax.set_xlim(x_min - padding, x_max + padding)
+            ax.set_ylim(y_min - padding, y_max + padding)
+        else:
+            ax.set_xlim(self.plot_x_min, self.plot_x_max)
+            ax.set_ylim(self.plot_y_min, self.plot_y_max)
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
         ax.set_xlabel('X [m]')
@@ -373,13 +392,15 @@ class PathPipelineNode(Node):
         stamp_nsec = msg.header.stamp.nanosec
         raw_count, xyz = self._pc2_to_xyz(msg)
         xy = xyz[:, :2]
-        xy_fov = filter_fov(
-            xy,
-            x_min=self.fov_x_min,
-            x_max=self.fov_x_max,
-            y_min=self.fov_y_min,
-            y_max=self.fov_y_max,
-        )
+        xy_fov = xy
+        if self.enable_rectangular_fov_filter:
+            xy_fov = filter_fov(
+                xy,
+                x_min=self.fov_x_min,
+                x_max=self.fov_x_max,
+                y_min=self.fov_y_min,
+                y_max=self.fov_y_max,
+            )
         if self.enable_chassis_exclusion:
             xy_fov = remove_xy_box(
                 xy_fov,

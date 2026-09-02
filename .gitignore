@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Editor and operating-system files
+.DS_Store
+*.swp
+*.swo
+
+# ROS 2/colcon outputs if the repository is built in place
+build/
+install/
+log/
