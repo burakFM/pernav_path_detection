@@ -3,42 +3,6 @@ import math
 import numpy as np
 
 
-def filter_fov(
-    xy: np.ndarray,
-    x_min: float = 0.0,
-    x_max: float = 20.0,
-    y_min: float = -10.0,
-    y_max: float = 10.0,
-) -> np.ndarray:
-    """Crop XY points to a rectangular FOV."""
-    if xy.size == 0:
-        return xy
-
-    mask = (
-        (xy[:, 0] >= x_min) & (xy[:, 0] <= x_max) &
-        (xy[:, 1] >= y_min) & (xy[:, 1] <= y_max)
-    )
-    return xy[mask]
-
-
-def remove_xy_box(
-    xy: np.ndarray,
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-) -> np.ndarray:
-    """Remove points inside an XY rectangle, including its boundaries."""
-    if xy.size == 0:
-        return xy
-
-    inside_box = (
-        (xy[:, 0] >= x_min) & (xy[:, 0] <= x_max) &
-        (xy[:, 1] >= y_min) & (xy[:, 1] <= y_max)
-    )
-    return xy[~inside_box]
-
-
 def ransac_line_2d_continuous(
     points: np.ndarray,
     distance_threshold: float,

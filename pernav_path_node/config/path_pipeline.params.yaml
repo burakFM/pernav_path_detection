@@ -3,39 +3,27 @@ path_pipeline_node:
     # Input PointCloud2 topic name.
     input_topic: /pcl_world_fov
 
-    # Optionally apply an additional rectangular crop to the input cloud.
-    # Keep this disabled when input_topic is already spatially filtered.
-    enable_rectangular_fov_filter: false
+    # World-frame PointStamped reference published by rearaxle_to_world_node.
+    # Detection waits for a reference with exactly the input cloud's timestamp.
+    row_start_ref_topic: /pernav/row_start_ref_world
+    row_start_ref_queue_size: 100
 
-    # Rectangular FOV crop in input-cloud XY coordinates [m].
-    # These limits are used only when enable_rectangular_fov_filter is true.
-    # Keep points with x in [fov_x_min, fov_x_max] and y in [fov_y_min, fov_y_max].
-    fov_x_min: 0.0
-    fov_x_max: 20.0
-    fov_y_min: -10.0
-    fov_y_max: 10.0
-
-    # Remove the tractor chassis region before row detection.
-    enable_chassis_exclusion: false
-    chassis_exclusion_x_min: 0.0
-    chassis_exclusion_x_max: 5.0
-    chassis_exclusion_y_min: -2.0
-    chassis_exclusion_y_max: 2.0
+    # Tractor-relative FOV and chassis filters belong to rearaxle_to_world_node.
 
     # Enable/disable row detection stage in callback.
     enable_row_detection: true
 
     # RANSAC inlier distance threshold to candidate row line [m].
-    row_distance_threshold: 0.25
+    row_distance_threshold: 0.5
 
     # Maximum allowed gap along projected inlier sequence for one continuous row [m].
-    row_max_gap: 0.8
+    row_max_gap: 1.8
 
     # Number of random RANSAC trials per row extraction cycle.
-    row_max_iterations: 400
+    row_max_iterations: 500
 
     # Minimum inliers required to accept a detected row segment.
-    row_min_segment_inliers: 40
+    row_min_segment_inliers: 15
 
     # Max number of rows to extract from one frame.
     row_max_rows: 8
@@ -46,18 +34,35 @@ path_pipeline_node:
     # Stop iterative extraction when remaining points are below this count.
     row_min_points_left: 25
 
-    # Reference point [m] used to orient row start/end endpoints consistently.
-    row_start_ref_x: 3.0
-    row_start_ref_y: 0.0
-
     # Enable/disable path construction from detected row pairs.
     enable_path_detection: true
 
     # Maximum allowed distance [m] between two row start points to form one path.
-    path_width: 3.8
+    path_width: 4.2
 
     # Remove paths shorter than this value [m].
     min_path_length: 1.0
+
+    # Match corrected paths across scans and publish cumulative mean start X/Y.
+    enable_path_start_tracking: true
+
+    # Maximum distance [m] from a detection to a track's averaged start.
+    tracking_max_distance: 1.0
+
+    # Maximum directed heading difference [deg]; headings are not averaged.
+    tracking_max_heading_deg: 20.0
+
+    # Matched observations required before publishing a new track (1 = immediate).
+    tracking_min_observations: 3
+
+    # Drop unconfirmed candidates after more than this many consecutive misses.
+    # Confirmed tracks retain their mean/count until restart or timestamp rewind.
+    tracking_candidate_max_missed_scans: 5
+
+    # Reject competing matches with cost differences below this value [m].
+    # Cost = distance + 0.25 * max_distance * heading_difference / max_heading.
+    # Set to 0 to disable ambiguity rejection. Assignment remains one-to-one.
+    tracking_ambiguity_margin: 0.15
 
     # Enable/disable group-based parallel correction of paths.
     enable_parallel_correction: true
@@ -77,6 +82,22 @@ path_pipeline_node:
     # Enable/disable publishing path start poses as geometry_msgs/PoseArray.
     enable_path_publisher: true
 
+    # Publish the shortest XY distance [m] from row_start_ref_world to the
+    # nearest retained finite group start line. Publishing begins after the
+    # first valid group line is created.
+    enable_group_start_distance_publisher: true
+    group_start_distance_topic: /pernav/group_start_line_distance
+
+    # Stop row/path searches after the distance crosses from above this value
+    # to at or below it. The last nonempty confirmed paths and start lines keep
+    # publishing. The stop remains latched until restart or timestamp rewind.
+    enable_group_start_distance_stop: true
+    group_start_distance_stop_threshold: 0.2
+
+    # Reset event from fov_filter_node when the completed FOV is deactivated.
+    # Clears tracks, retained lines, cached outputs, and the detection-stop latch.
+    path_pipeline_reset_topic: /pernav/path_pipeline_reset
+
     # Output topic for path start poses.
     path_output_topic: /pernav/paths
 
@@ -86,7 +107,7 @@ path_pipeline_node:
     # Enable/disable RViz debug marker publishing for corrected paths.
     enable_marker_publisher: true
 
-    # Output MarkerArray topic for path line visualization.
+    # Output MarkerArray topic for current path lines and persistent confirmed entrances.
     marker_output_topic: /pernav/path_markers
 
     # LINE_STRIP width [m] for each path marker.
@@ -101,16 +122,25 @@ path_pipeline_node:
     # Enable/disable direct notebook-style matplotlib plotting inside the node.
     enable_notebook_plot: true
 
-    # Plot only every Nth frame to reduce GUI load.
-    plot_every_n_frames: 10
+    # Record the same plot as an MP4; also works with enable_notebook_plot: false.
+    enable_plot_video: true
 
-    # Automatically follow the incoming cloud's world-frame XY bounds.
+    # Relative to the node's working directory; {timestamp} makes each run unique.
+    plot_video_output_path: output/pernav_path_plot_{timestamp}.mp4
+
+    # Playback rate, not capture rate. Every scan at ~10 Hz gives ~real-time video.
+    plot_video_fps: 10.0
+
+    # Draw and record every synchronized scan (1 = no frame skipping).
+    plot_every_n_frames: 1
+
+    # Fit world-frame bounds to the current cloud and all stored confirmed starts.
     enable_plot_autoscale: true
 
     # Extra space [m] around the automatically calculated cloud bounds.
     plot_padding_m: 2.0
 
-    # Fallback fixed limits [m], used when autoscaling is disabled or the cloud is empty.
+    # Fixed limits [m], used when autoscaling is disabled or no cloud/confirmed starts exist.
     plot_x_min: 0.0
     plot_x_max: 20.0
     plot_y_min: -10.0
