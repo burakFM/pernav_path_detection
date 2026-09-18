@@ -64,7 +64,55 @@ class PathStartTracker:
             return None
         return start, delta, math.atan2(delta[1], delta[0])
 
-    def update(self, paths: list[dict], stamp_ns: int) -> list[dict]:
+    def _remove_duplicate_tracks(
+        self,
+        eor_line_reference: np.ndarray | None,
+        eor_line_direction: np.ndarray | None,
+    ) -> set[int]:
+        if eor_line_reference is None or eor_line_direction is None:
+            return set()
+        reference = np.asarray(eor_line_reference, dtype=float)
+        direction = np.asarray(eor_line_direction, dtype=float)
+        direction_length = float(np.linalg.norm(direction))
+        if (
+            reference.shape != (2,)
+            or direction.shape != (2,)
+            or not np.isfinite(reference).all()
+            or not np.isfinite(direction).all()
+            or direction_length <= 1e-9
+        ):
+            return set()
+        direction /= direction_length
+        normal = np.array([-direction[1], direction[0]], dtype=float)
+        removed_ids: set[int] = set()
+        ordered_tracks = sorted(
+            self.tracks.values(),
+            key=lambda track: (
+                abs(float((track.mean_xy - reference) @ normal)),
+                -track.observations,
+                track.track_id,
+            ),
+        )
+        kept_tracks: list[PathTrack] = []
+        for track in ordered_tracks:
+            if any(
+                np.linalg.norm(track.mean_xy - kept.mean_xy) <= self.max_distance
+                for kept in kept_tracks
+            ):
+                removed_ids.add(track.track_id)
+            else:
+                kept_tracks.append(track)
+        for track_id in removed_ids:
+            del self.tracks[track_id]
+        return removed_ids
+
+    def update(
+        self,
+        paths: list[dict],
+        stamp_ns: int,
+        eor_line_reference: np.ndarray | None = None,
+        eor_line_direction: np.ndarray | None = None,
+    ) -> list[dict]:
         """Return confirmed paths seen in this scan, sorted by persistent ID.
 
         Duplicate timestamps do not count again. Backward time starts a fresh
@@ -146,10 +194,15 @@ class PathStartTracker:
                     and track.missed_scans > self.candidate_max_missed_scans):
                 del self.tracks[track.track_id]
 
+        removed_ids = self._remove_duplicate_tracks(
+            eor_line_reference,
+            eor_line_direction,
+        )
+
         output = []
         id_map = {int(valid[j][0]['path_id']): track.track_id for j, track in matches.items()}
         for j, track in matches.items():
-            if track.observations < self.min_observations:
+            if track.track_id in removed_ids or track.observations < self.min_observations:
                 continue
             record, (start, delta, _) = valid[j]
             result = dict(record)

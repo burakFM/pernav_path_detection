@@ -24,6 +24,7 @@ from std_msgs.msg import Empty, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .path_start_tracker import PathStartTracker
+from .start_line_tracker import StartLineTracker
 from .pipeline_helpers import (  # type: ignore[reportMissingImports]
     apply_parallel_correction,
     build_group_start_lines,
@@ -42,9 +43,11 @@ class PathPipelineNode(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('input_topic', '/pcl_world_fov'),
+                ('input_topic', '/pcl_world_roi'),
                 ('row_start_ref_topic', '/pernav/row_start_ref_world'),
                 ('row_start_ref_queue_size', 100),
+                ('roi_axes_marker_topic', '/roi_markers_axes'),
+                ('enable_roi_strip_detection', True),
                 ('enable_row_detection', True),
                 ('row_distance_threshold', 0.25),
                 ('row_max_gap', 0.6),
@@ -71,6 +74,8 @@ class PathPipelineNode(Node):
                 ('path_sensor_id', 'pernav_path_node'),
                 ('enable_marker_publisher', True),
                 ('marker_output_topic', '/pernav/path_markers'),
+                ('enable_row_marker_publisher', True),
+                ('row_marker_output_topic', '/pernav/detected_row_markers'),
                 ('marker_line_width', 0.08),
                 ('marker_lifetime_sec', 0.2),
                 ('enable_notebook_plot', False),
@@ -85,6 +90,10 @@ class PathPipelineNode(Node):
                 ('plot_y_min', -10.0),
                 ('plot_y_max', 10.0),
                 ('start_line_extension_m', 2.0),
+                ('start_line_eor_marker_topic', '/roi_markers'),
+                ('start_line_residual_threshold', 0.5),
+                ('start_line_min_anchors', 2),
+                ('start_line_switch_confirmations', 5),
                 ('enable_group_start_line_marker', True),
                 ('enable_group_start_distance_publisher', True),
                 ('group_start_distance_topic', '/pernav/group_start_line_distance'),
@@ -97,8 +106,14 @@ class PathPipelineNode(Node):
         self.input_topic = self.get_parameter('input_topic').value
         self.row_start_ref_topic = str(self.get_parameter('row_start_ref_topic').value)
         self.row_start_ref_queue_size = max(1, int(self.get_parameter('row_start_ref_queue_size').value))
+        self.roi_axes_marker_topic = str(self.get_parameter('roi_axes_marker_topic').value)
+        self.enable_roi_strip_detection = bool(
+            self.get_parameter('enable_roi_strip_detection').value
+        )
         self._pending_clouds: OrderedDict[tuple[int, int], PointCloud2] = OrderedDict()
         self._pending_references: OrderedDict[tuple[int, int], PointStamped] = OrderedDict()
+        self._roi_strip_normal: np.ndarray | None = None
+        self._roi_strip_boundaries: np.ndarray | None = None
         self.enable_row_detection = bool(self.get_parameter('enable_row_detection').value)
         self.row_distance_threshold = float(self.get_parameter('row_distance_threshold').value)
         self.row_max_gap = float(self.get_parameter('row_max_gap').value)
@@ -127,6 +142,10 @@ class PathPipelineNode(Node):
         self.path_sensor_id = str(self.get_parameter('path_sensor_id').value)
         self.enable_marker_publisher = bool(self.get_parameter('enable_marker_publisher').value)
         self.marker_output_topic = str(self.get_parameter('marker_output_topic').value)
+        self.enable_row_marker_publisher = bool(
+            self.get_parameter('enable_row_marker_publisher').value
+        )
+        self.row_marker_output_topic = str(self.get_parameter('row_marker_output_topic').value)
         self.marker_line_width = float(self.get_parameter('marker_line_width').value)
         self.marker_lifetime_sec = float(self.get_parameter('marker_lifetime_sec').value)
         self.enable_notebook_plot = bool(self.get_parameter('enable_notebook_plot').value)
@@ -141,6 +160,18 @@ class PathPipelineNode(Node):
         self.plot_y_min = float(self.get_parameter('plot_y_min').value)
         self.plot_y_max = float(self.get_parameter('plot_y_max').value)
         self.start_line_extension_m = float(self.get_parameter('start_line_extension_m').value)
+        self.start_line_eor_marker_topic = str(
+            self.get_parameter('start_line_eor_marker_topic').value
+        )
+        self.start_line_tracker = StartLineTracker(
+            residual_threshold=float(self.get_parameter('start_line_residual_threshold').value),
+            min_anchors=int(self.get_parameter('start_line_min_anchors').value),
+            switch_confirmations=int(self.get_parameter('start_line_switch_confirmations').value),
+            extension_m=self.start_line_extension_m,
+            max_eor_angle_deg=float(self.get_parameter('group_angle_thresh_deg').value),
+        )
+        self._eor_line_reference: np.ndarray | None = None
+        self._eor_line_direction: np.ndarray | None = None
         self.enable_group_start_line_marker = bool(self.get_parameter('enable_group_start_line_marker').value)
         self.enable_group_start_distance_publisher = bool(
             self.get_parameter('enable_group_start_distance_publisher').value
@@ -174,6 +205,9 @@ class PathPipelineNode(Node):
 
         self.path_publisher = self.create_publisher(PoseArray, self.path_output_topic, 10)
         self.marker_publisher = self.create_publisher(MarkerArray, self.marker_output_topic, 10)
+        self.row_marker_publisher = self.create_publisher(
+            MarkerArray, self.row_marker_output_topic, 10,
+        )
         self.group_start_distance_publisher = self.create_publisher(
             Float64, self.group_start_distance_topic, 10,
         )
@@ -200,19 +234,36 @@ class PathPipelineNode(Node):
             self.path_pipeline_reset_callback,
             10,
         )
+        self.eor_line_subscription = self.create_subscription(
+            Marker,
+            self.start_line_eor_marker_topic,
+            self.eor_line_marker_callback,
+            10,
+        )
+        self.roi_axes_subscription = self.create_subscription(
+            Marker,
+            self.roi_axes_marker_topic,
+            self.roi_axes_marker_callback,
+            10,
+        )
         self.get_logger().info(
             f'Path pipeline node listening on topic {self.input_topic} '
             f'| synchronized_reference={self.row_start_ref_topic} '
             f'| row_detection={self.enable_row_detection} '
+            f'| roi_strip_detection={self.enable_roi_strip_detection} '
+            f'({self.roi_axes_marker_topic}) '
             f'| path_detection={self.enable_path_detection} '
             f'| path_start_tracking={self.enable_path_start_tracking} '
             f'| parallel_correction={self.enable_parallel_correction} '
             f'| path_pub={self.enable_path_publisher} ({self.path_output_topic}) '
             f'| marker_pub={self.enable_marker_publisher} ({self.marker_output_topic}) '
+            f'| row_marker_pub={self.enable_row_marker_publisher} '
+            f'({self.row_marker_output_topic}) '
             f'| notebook_plot={self.enable_notebook_plot} '
             f'| plot_video={self.enable_plot_video} '
             f'| plot_autoscale={self.enable_plot_autoscale} '
             f'| group_start_line_marker={self.enable_group_start_line_marker} '
+            f'| eor_line={self.start_line_eor_marker_topic} '
             f'| group_start_distance_pub={self.enable_group_start_distance_publisher} '
             f'({self.group_start_distance_topic}) '
             f'| group_start_distance_stop={self.enable_group_start_distance_stop} '
@@ -282,9 +333,119 @@ class PathPipelineNode(Node):
         self._last_confirmed_output_paths.clear()
         self._last_confirmed_group_start_lines.clear()
         self.path_start_tracker.reset()
+        self.start_line_tracker.reset()
+        self._eor_line_reference = None
+        self._eor_line_direction = None
+        self._roi_strip_normal = None
+        self._roi_strip_boundaries = None
+
+    def eor_line_marker_callback(self, marker: Marker) -> None:
+        """Store the frozen ROI centerline direction as the start-line orientation prior."""
+        if marker.action == Marker.DELETE or marker.action == Marker.DELETEALL:
+            self._eor_line_reference = None
+            self._eor_line_direction = None
+            return
+        if marker.ns != 'world_roi' or marker.type != Marker.LINE_LIST or len(marker.points) < 2:
+            return
+        direction = np.array([
+            marker.points[1].x - marker.points[0].x,
+            marker.points[1].y - marker.points[0].y,
+        ], dtype=float)
+        length = float(np.linalg.norm(direction))
+        if np.isfinite(direction).all() and length > 1e-9:
+            self._eor_line_reference = np.array(
+                [marker.points[0].x, marker.points[0].y], dtype=float,
+            )
+            self._eor_line_direction = direction / length
+
+    def roi_axes_marker_callback(self, marker: Marker) -> None:
+        """Cache ordered infinite-line coordinates for ROI strip partitioning."""
+        if marker.action == Marker.DELETE or marker.action == Marker.DELETEALL:
+            self._roi_strip_normal = None
+            self._roi_strip_boundaries = None
+            return
+        if (
+            marker.ns != 'world_roi_axes'
+            or marker.type != Marker.LINE_LIST
+            or len(marker.points) < 4
+            or len(marker.points) % 2 != 0
+        ):
+            return
+        first_start = np.array([marker.points[0].x, marker.points[0].y], dtype=float)
+        first_end = np.array([marker.points[1].x, marker.points[1].y], dtype=float)
+        direction = first_end - first_start
+        direction_length = float(np.linalg.norm(direction))
+        if not np.isfinite(direction).all() or direction_length <= 1e-9:
+            return
+        direction /= direction_length
+        normal = np.array([-direction[1], direction[0]], dtype=float)
+        midpoints = np.array([
+            [
+                0.5 * (marker.points[index].x + marker.points[index + 1].x),
+                0.5 * (marker.points[index].y + marker.points[index + 1].y),
+            ]
+            for index in range(0, len(marker.points), 2)
+        ], dtype=float)
+        boundaries = np.unique(np.round(midpoints @ normal, decimals=9))
+        if boundaries.size < 2:
+            return
+        self._roi_strip_normal = normal
+        self._roi_strip_boundaries = np.sort(boundaries)
+
+    def _detect_rows_in_roi_strips(
+        self,
+        xy_roi: np.ndarray,
+        reference: PointStamped,
+    ) -> tuple[list[dict], int]:
+        normal = self._roi_strip_normal
+        boundaries = self._roi_strip_boundaries
+        if (
+            not self.enable_roi_strip_detection
+            or normal is None
+            or boundaries is None
+            or boundaries.size < 2
+        ):
+            regions = [xy_roi]
+        else:
+            coordinates = xy_roi @ normal
+            regions = [
+                xy_roi[(coordinates >= lower) & (coordinates < upper)]
+                for lower, upper in zip(boundaries[:-1], boundaries[1:])
+            ]
+
+        row_records: list[dict] = []
+        processed_regions = 0
+        for region_id, region_points in enumerate(regions, start=1):
+            if region_points.shape[0] < self.row_min_segment_inliers:
+                continue
+            processed_regions += 1
+            region_rows = detect_rows_from_xy(
+                region_points,
+                distance_threshold=self.row_distance_threshold,
+                max_gap=self.row_max_gap,
+                max_iterations=self.row_max_iterations,
+                min_segment_inliers=self.row_min_segment_inliers,
+                max_rows=self.row_max_rows,
+                remove_radius=self.row_remove_radius,
+                start_ref_point=(reference.point.x, reference.point.y),
+                min_points_left=self.row_min_points_left,
+                eor_line_reference=(
+                    tuple(self._eor_line_reference)
+                    if self._eor_line_reference is not None else None
+                ),
+                eor_line_direction=(
+                    tuple(self._eor_line_direction)
+                    if self._eor_line_direction is not None else None
+                ),
+            )
+            for row in region_rows:
+                row['row_id'] = len(row_records) + 1
+                row['roi_strip_id'] = region_id
+                row_records.append(row)
+        return row_records, processed_regions
 
     def path_pipeline_reset_callback(self, _msg: Empty) -> None:
-        """Clear all state belonging to the completed FOV cycle."""
+        """Clear all state belonging to the completed ROI cycle."""
         self._clear_path_pipeline_cycle_state()
         self._pending_clouds.clear()
         self._pending_references.clear()
@@ -304,8 +465,17 @@ class PathPipelineNode(Node):
             markers.markers.append(delete_all)
             self.marker_publisher.publish(markers)
 
+        if self.enable_row_marker_publisher:
+            delete_all = Marker()
+            delete_all.header.frame_id = 'world'
+            delete_all.header.stamp = self.get_clock().now().to_msg()
+            delete_all.action = Marker.DELETEALL
+            markers = MarkerArray()
+            markers.markers.append(delete_all)
+            self.row_marker_publisher.publish(markers)
+
         self.get_logger().info(
-            'Path pipeline cycle reset; waiting for point clouds from the next FOV.'
+            'Path pipeline cycle reset; waiting for point clouds from the next ROI.'
         )
 
     def _update_group_start_distance_stop(self, distance: float) -> bool:
@@ -367,7 +537,7 @@ class PathPipelineNode(Node):
 
     def _update_notebook_plot(
         self,
-        xy_fov: np.ndarray,
+        xy_roi: np.ndarray,
         row_records: list[dict],
         output_paths: list[dict],
         group_start_lines: list[dict],
@@ -384,8 +554,8 @@ class PathPipelineNode(Node):
             [[rec['path_start_x'], rec['path_start_y']] for rec in confirmed_starts], dtype=float,
         ).reshape(-1, 2)
 
-        if xy_fov.size > 0:
-            ax.scatter(xy_fov[:, 0], xy_fov[:, 1], s=2, color='lightgray', label='FOV points')
+        if xy_roi.size > 0:
+            ax.scatter(xy_roi[:, 0], xy_roi[:, 1], s=2, color='lightgray', label='ROI points')
 
         used_row_ids = set()
         for rec in output_paths:
@@ -394,14 +564,21 @@ class PathPipelineNode(Node):
             if 'row_b_id' in rec:
                 used_row_ids.add(int(rec['row_b_id']))
 
-        rows_to_plot = [row for row in row_records if int(row.get('row_id', -1)) in used_row_ids]
-
-        for row in rows_to_plot:
+        for row in row_records:
+            row_id = int(row.get('row_id', -1))
+            used_by_path = row_id in used_row_ids
             sx, sy = float(row['start_x']), float(row['start_y'])
             ex, ey = float(row['end_x']), float(row['end_y'])
-            ax.plot([sx, ex], [sy, ey], linewidth=2.0, color='tab:orange', alpha=0.9)
-            ax.scatter([sx], [sy], s=28, color='red')
-            ax.text(sx, sy, f"R{int(row['row_id'])}", fontsize=8, color='tab:orange')
+            color = 'tab:orange' if used_by_path else 'goldenrod'
+            ax.plot(
+                [sx, ex], [sy, ey],
+                linestyle='-' if used_by_path else '--',
+                linewidth=2.0 if used_by_path else 1.4,
+                color=color,
+                alpha=0.9 if used_by_path else 0.75,
+            )
+            ax.scatter([sx], [sy], s=28 if used_by_path else 18, color='red' if used_by_path else color)
+            ax.text(sx, sy, f"R{row_id}", fontsize=8, color=color)
 
         for rec in output_paths:
             sx, sy = float(rec['path_start_x']), float(rec['path_start_y'])
@@ -442,7 +619,7 @@ class PathPipelineNode(Node):
             )
 
         # Stored world positions also determine the viewport, including empty scans.
-        bounds_xy = np.vstack((xy_fov, confirmed_xy))
+        bounds_xy = np.vstack((xy_roi, confirmed_xy))
         if self.enable_plot_autoscale and bounds_xy.size > 0:
             x_min = float(np.min(bounds_xy[:, 0]))
             x_max = float(np.max(bounds_xy[:, 0]))
@@ -598,6 +775,38 @@ class PathPipelineNode(Node):
         self.marker_publisher.publish(marker_array)
         return len(marker_array.markers)
 
+    def _publish_row_markers(self, src_msg: PointCloud2, row_records: list[dict]) -> int:
+        marker_array = MarkerArray()
+        for row in row_records:
+            marker = Marker()
+            marker.header = src_msg.header
+            marker.ns = 'pernav_detected_rows'
+            marker.id = int(row['row_id'])
+            marker.type = Marker.LINE_STRIP
+            marker.action = Marker.ADD
+
+            start = Point()
+            start.x = float(row['start_x'])
+            start.y = float(row['start_y'])
+            start.z = 0.04
+            end = Point()
+            end.x = float(row['end_x'])
+            end.y = float(row['end_y'])
+            end.z = 0.04
+            marker.points = [start, end]
+
+            marker.scale.x = self.marker_line_width
+            marker.color.r = 1.0
+            marker.color.g = 0.65
+            marker.color.b = 0.0
+            marker.color.a = 0.95
+            marker.lifetime.sec = int(self.marker_lifetime_sec)
+            marker.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
+            marker_array.markers.append(marker)
+
+        self.row_marker_publisher.publish(marker_array)
+        return len(marker_array.markers)
+
     def _publish_paths(self, src_msg: PointCloud2, path_records: list[dict]) -> int:
         msg = PoseArray()
         msg.header = src_msg.header
@@ -689,28 +898,21 @@ class PathPipelineNode(Node):
         self._prepare_group_start_distance_stamp(stamp_ns)
         raw_count, xyz = self._pc2_to_xyz(msg)
         xy = xyz[:, :2]
-        xy_fov = xy
+        xy_roi = xy
 
         valid_xyz_count = int(xyz.shape[0])
-        fov_xy_count = int(xy_fov.shape[0])
+        roi_xy_count = int(xy_roi.shape[0])
 
         rows_detected = -1
+        roi_strips_processed = 0
         row_records: list[dict] = []
         if (
             self.enable_row_detection
             and not self._row_path_detection_stopped
-            and fov_xy_count >= self.row_min_segment_inliers
+            and roi_xy_count >= self.row_min_segment_inliers
         ):
-            row_records = detect_rows_from_xy(
-                xy_fov,
-                distance_threshold=self.row_distance_threshold,
-                max_gap=self.row_max_gap,
-                max_iterations=self.row_max_iterations,
-                min_segment_inliers=self.row_min_segment_inliers,
-                max_rows=self.row_max_rows,
-                remove_radius=self.row_remove_radius,
-                start_ref_point=(reference.point.x, reference.point.y),
-                min_points_left=self.row_min_points_left,
+            row_records, roi_strips_processed = self._detect_rows_in_roi_strips(
+                xy_roi, reference,
             )
             rows_detected = len(row_records)
 
@@ -718,10 +920,14 @@ class PathPipelineNode(Node):
         groups_detected = -1
         published_paths = -1
         published_markers = -1
+        published_row_markers = -1
         published_group_start_distance: float | None = None
         group_start_lines_count = -1
         output_paths: list[dict] = []
         group_start_lines: list[dict] = []
+        if self.enable_row_marker_publisher:
+            published_row_markers = self._publish_row_markers(msg, row_records)
+
         if self.enable_path_detection and not self._row_path_detection_stopped and row_records:
             path_records = build_paths_from_rows(
                 row_records,
@@ -752,11 +958,27 @@ class PathPipelineNode(Node):
                 group_start_lines_count = len(group_start_lines)
             else:
                 if self.enable_path_start_tracking:
-                    output_paths = self.path_start_tracker.update(output_paths, stamp_ns)
-                if self.enable_parallel_correction:
-                    group_start_lines = build_group_start_lines(
-                        output_paths, extension_m=self.start_line_extension_m,
+                    output_paths = self.path_start_tracker.update(
+                        output_paths,
+                        stamp_ns,
+                        self._eor_line_reference,
+                        self._eor_line_direction,
                     )
+                if self.enable_parallel_correction:
+                    if (
+                        self.enable_path_start_tracking
+                        and self._eor_line_reference is not None
+                        and self._eor_line_direction is not None
+                    ):
+                        group_start_lines = self.start_line_tracker.update(
+                            self.path_start_tracker.confirmed_starts(),
+                            self._eor_line_reference,
+                            self._eor_line_direction,
+                        )
+                    else:
+                        group_start_lines = build_group_start_lines(
+                            output_paths, extension_m=self.start_line_extension_m,
+                        )
                     group_start_lines_count = len(group_start_lines)
 
                 # Keep the last nonempty confirmed result. If the falling
@@ -795,7 +1017,8 @@ class PathPipelineNode(Node):
             f'| stamp={stamp_sec}.{stamp_nsec:09d} '
             f'| width={msg.width} | height={msg.height} | point_step={msg.point_step} '
             f'| raw_points={raw_count} | valid_xyz_points={valid_xyz_count} '
-            f'| fov_xy_points={fov_xy_count} '
+            f'| roi_xy_points={roi_xy_count} '
+            f'| roi_strips_processed={roi_strips_processed} '
             f'| rows_detected={rows_detected} '
             f'| paths_detected={paths_detected} '
             f'| groups_detected={groups_detected} '
@@ -803,11 +1026,12 @@ class PathPipelineNode(Node):
             f'| group_start_distance={published_group_start_distance} '
             f'| detection_stopped={self._row_path_detection_stopped} '
             f'| published_paths={published_paths} '
-            f'| published_markers={published_markers}'
+            f'| published_markers={published_markers} '
+            f'| published_row_markers={published_row_markers}'
         )
 
         if (self.enable_notebook_plot or self.enable_plot_video) and (self.frame_count % self.plot_every_n_frames == 0):
-            self._update_notebook_plot(xy_fov, row_records, output_paths, group_start_lines)
+            self._update_notebook_plot(xy_roi, row_records, output_paths, group_start_lines)
 
 
 def main(args=None) -> None:

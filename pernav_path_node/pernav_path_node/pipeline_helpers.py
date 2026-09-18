@@ -103,6 +103,8 @@ def detect_rows_from_xy(
     remove_radius: float,
     start_ref_point: tuple[float, float],
     min_points_left: int,
+    eor_line_reference: tuple[float, float] | None = None,
+    eor_line_direction: tuple[float, float] | None = None,
 ) -> list[dict]:
     """Detect row segments and return notebook-style row metadata records."""
     if xy.size == 0:
@@ -111,6 +113,22 @@ def detect_rows_from_xy(
     working_points = xy.copy()
     row_records: list[dict] = []
     ref_point = np.array(start_ref_point, dtype=float)
+    eor_reference = None
+    eor_normal = None
+    if eor_line_reference is not None and eor_line_direction is not None:
+        candidate_reference = np.asarray(eor_line_reference, dtype=float)
+        candidate_direction = np.asarray(eor_line_direction, dtype=float)
+        direction_length = float(np.linalg.norm(candidate_direction))
+        if (
+            candidate_reference.shape == (2,)
+            and candidate_direction.shape == (2,)
+            and np.isfinite(candidate_reference).all()
+            and np.isfinite(candidate_direction).all()
+            and direction_length > 1e-9
+        ):
+            candidate_direction /= direction_length
+            eor_reference = candidate_reference
+            eor_normal = np.array([-candidate_direction[1], candidate_direction[0]], dtype=float)
 
     for _ in range(max_rows):
         line_k, inlier_mask_k = ransac_line_2d_continuous(
@@ -138,7 +156,12 @@ def detect_rows_from_xy(
         p_start = line_org + t_min * line_dir
         p_end = line_org + t_max * line_dir
 
-        if np.linalg.norm(p_start - ref_point) > np.linalg.norm(p_end - ref_point):
+        if eor_reference is not None and eor_normal is not None:
+            start_distance = abs(float((p_start - eor_reference) @ eor_normal))
+            end_distance = abs(float((p_end - eor_reference) @ eor_normal))
+            if start_distance > end_distance:
+                p_start, p_end = p_end, p_start
+        elif np.linalg.norm(p_start - ref_point) > np.linalg.norm(p_end - ref_point):
             p_start, p_end = p_end, p_start
 
         row_records.append(

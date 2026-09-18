@@ -1,29 +1,35 @@
 path_pipeline_node:
   ros__parameters:
     # Input PointCloud2 topic name.
-    input_topic: /pcl_world_fov
+    input_topic: /pcl_world_roi
 
     # World-frame PointStamped reference published by rearaxle_to_world_node.
     # Detection waits for a reference with exactly the input cloud's timestamp.
     row_start_ref_topic: /pernav/row_start_ref_world
     row_start_ref_queue_size: 100
 
-    # Tractor-relative FOV and chassis filters belong to rearaxle_to_world_node.
+    # Parallel ROI axis lines used to partition /pcl_world_roi into detection strips.
+    roi_axes_marker_topic: /roi_markers_axes
+
+    # Run the existing row detector independently between consecutive axis lines.
+    enable_roi_strip_detection: true
+
+    # Tractor-relative ROI and chassis filters belong to rearaxle_to_world_node.
 
     # Enable/disable row detection stage in callback.
     enable_row_detection: true
 
     # RANSAC inlier distance threshold to candidate row line [m].
-    row_distance_threshold: 0.5
+    row_distance_threshold: 0.8
 
     # Maximum allowed gap along projected inlier sequence for one continuous row [m].
-    row_max_gap: 1.8
+    row_max_gap: 1.5
 
     # Number of random RANSAC trials per row extraction cycle.
     row_max_iterations: 500
 
     # Minimum inliers required to accept a detected row segment.
-    row_min_segment_inliers: 15
+    row_min_segment_inliers: 10
 
     # Max number of rows to extract from one frame.
     row_max_rows: 8
@@ -79,6 +85,18 @@ path_pipeline_node:
     # Start-line extension [m] at both ends when fitting group start line.
     start_line_extension_m: 2.0
 
+    # Frozen ROI centerline marker supplies the expected start-line direction.
+    start_line_eor_marker_topic: /roi_markers
+
+    # Historical start anchors within this perpendicular distance form one line candidate.
+    start_line_residual_threshold: 0.5
+
+    # Distinct confirmed path-start anchors required to publish a candidate line.
+    start_line_min_anchors: 2
+
+    # A stronger competing line must persist this many frames before replacing the active line.
+    start_line_switch_confirmations: 5
+
     # Enable/disable publishing path start poses as geometry_msgs/PoseArray.
     enable_path_publisher: true
 
@@ -94,7 +112,7 @@ path_pipeline_node:
     enable_group_start_distance_stop: true
     group_start_distance_stop_threshold: 0.2
 
-    # Reset event from fov_filter_node when the completed FOV is deactivated.
+    # Reset event from roi_filter_node when the completed ROI is deactivated.
     # Clears tracks, retained lines, cached outputs, and the detection-stop latch.
     path_pipeline_reset_topic: /pernav/path_pipeline_reset
 
@@ -109,6 +127,10 @@ path_pipeline_node:
 
     # Output MarkerArray topic for current path lines and persistent confirmed entrances.
     marker_output_topic: /pernav/path_markers
+
+    # Publish every accepted RANSAC row from the current frame without tracking.
+    enable_row_marker_publisher: true
+    row_marker_output_topic: /pernav/detected_row_markers
 
     # LINE_STRIP width [m] for each path marker.
     marker_line_width: 0.08

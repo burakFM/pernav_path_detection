@@ -36,11 +36,11 @@ class RearAxleToWorldNode(Node):
                 ('row_start_ref_y', 0.0),
                 ('row_start_ref_topic', '/pernav/row_start_ref_world'),
                 # Optional XY filters in the rear-axle frame, before transformation.
-                ('enable_rectangular_fov_filter', False),
-                ('fov_x_min', 0.0),
-                ('fov_x_max', 20.0),
-                ('fov_y_min', -10.0),
-                ('fov_y_max', 10.0),
+                ('enable_rectangular_roi_filter', False),
+                ('roi_x_min', 0.0),
+                ('roi_x_max', 20.0),
+                ('roi_y_min', -10.0),
+                ('roi_y_max', 10.0),
                 ('enable_chassis_exclusion', False),
                 ('chassis_exclusion_x_min', 0.0),
                 ('chassis_exclusion_x_max', 4.0),
@@ -62,11 +62,11 @@ class RearAxleToWorldNode(Node):
         if not np.isfinite(self.row_start_ref_rear).all():
             raise ValueError('row_start_ref_x/y must be finite rear-axle coordinates.')
         self.row_start_ref_topic = str(self.get_parameter('row_start_ref_topic').value)
-        self.enable_rectangular_fov_filter = bool(self.get_parameter('enable_rectangular_fov_filter').value)
-        self.fov_x_min = float(self.get_parameter('fov_x_min').value)
-        self.fov_x_max = float(self.get_parameter('fov_x_max').value)
-        self.fov_y_min = float(self.get_parameter('fov_y_min').value)
-        self.fov_y_max = float(self.get_parameter('fov_y_max').value)
+        self.enable_rectangular_roi_filter = bool(self.get_parameter('enable_rectangular_roi_filter').value)
+        self.roi_x_min = float(self.get_parameter('roi_x_min').value)
+        self.roi_x_max = float(self.get_parameter('roi_x_max').value)
+        self.roi_y_min = float(self.get_parameter('roi_y_min').value)
+        self.roi_y_max = float(self.get_parameter('roi_y_max').value)
         self.enable_chassis_exclusion = bool(self.get_parameter('enable_chassis_exclusion').value)
         self.chassis_exclusion_x_min = float(self.get_parameter('chassis_exclusion_x_min').value)
         self.chassis_exclusion_x_max = float(self.get_parameter('chassis_exclusion_x_max').value)
@@ -101,20 +101,20 @@ class RearAxleToWorldNode(Node):
         self.get_logger().info(f'Output cloud: {self.output_pointcloud_topic}')
         self.get_logger().info(f'World-frame row-start reference: {self.row_start_ref_topic}')
         self.get_logger().info(
-            f'Rear-axle filters: rectangular_fov_filter={self.enable_rectangular_fov_filter} '
+            f'Rear-axle filters: rectangular_roi_filter={self.enable_rectangular_roi_filter} '
             f'| chassis_exclusion={self.enable_chassis_exclusion}'
         )
 
     def _filter_rear_axle_points(self, points_xyz: np.ndarray) -> np.ndarray:
         """Apply tractor-relative XY bounds while retaining each point's XYZ."""
-        if self.enable_rectangular_fov_filter:
-            inside_fov = (
-                (points_xyz[:, 0] >= self.fov_x_min)
-                & (points_xyz[:, 0] <= self.fov_x_max)
-                & (points_xyz[:, 1] >= self.fov_y_min)
-                & (points_xyz[:, 1] <= self.fov_y_max)
+        if self.enable_rectangular_roi_filter:
+            inside_roi = (
+                (points_xyz[:, 0] >= self.roi_x_min)
+                & (points_xyz[:, 0] <= self.roi_x_max)
+                & (points_xyz[:, 1] >= self.roi_y_min)
+                & (points_xyz[:, 1] <= self.roi_y_max)
             )
-            points_xyz = points_xyz[inside_fov]
+            points_xyz = points_xyz[inside_roi]
 
         if self.enable_chassis_exclusion:
             inside_chassis = (

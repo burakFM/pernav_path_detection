@@ -27,7 +27,7 @@ ros2 bag play -l ../data/SPE_2026-06-11_Linden/rosbag2/rosbag2_0.mcap
 
 ```mermaid
 flowchart LR
-    A[/pcl_world_fov PointCloud2/] --> S[Match exact scan timestamp]
+    A[/pcl_world_roi PointCloud2/] --> S[Match exact scan timestamp]
     R[/pernav/row_start_ref_world PointStamped/] --> S
     S --> B[Parse XYZ]
     B --> C[Project to XY]
@@ -40,7 +40,7 @@ flowchart LR
     H --> K[Retain latest line per group]
     R --> K
     K --> L[/pernav/group_start_line_distance Float64/]
-    FOV[fov_filter_node] --> RESET[/pernav/path_pipeline_reset Empty/]
+    ROI[roi_filter_node] --> RESET[/pernav/path_pipeline_reset Empty/]
     RESET --> T
     T --> I[/pernav/paths PoseArray/]
     H --> J[/pernav/path_markers MarkerArray/]
@@ -49,9 +49,12 @@ flowchart LR
 
 ## Runtime flow (short)
 
-1. Match the cloud to its world-frame row-start reference by exact timestamp, then parse finite XYZ.
-2. Project the already-filtered world-frame cloud to XY.
-3. Detect continuous row segments with iterative RANSAC, orienting starts toward the matched reference.
+1. Match the cloud to its world-frame tractor reference by exact timestamp, then parse finite XYZ.
+2. Project the already-filtered world-frame cloud to XY and partition it into
+    strips between consecutive `/roi_markers_axes` lines.
+3. Run continuous-row RANSAC independently in each strip, then combine and
+    renumber the detected rows. The endpoint with the
+    smaller perpendicular distance to the frozen EOR line becomes the row start.
 4. Pair nearby rows to create center paths.
 5. Group paths by angle and distance.
 6. Use the longest path per group as reference and align others in parallel.
@@ -63,32 +66,37 @@ flowchart LR
     threshold, latch row/path detection off and freeze the last confirmed geometry.
 11. Publish the current or frozen confirmed paths and RViz markers.
 
-The tractor-relative rectangular FOV crop and chassis exclusion are configured in
+The tractor-relative rectangular ROI crop and chassis exclusion are configured in
 `rearaxle_to_world_node`, before the rear-axle-to-world transform. Both are disabled
 by default. This node retains finite-point validation but applies no tractor-relative crop.
 
 The rear-axle reference parameters `row_start_ref_x/y` now belong to
 `rearaxle_to_world_node`. This node subscribes to `row_start_ref_topic`
 (default `/pernav/row_start_ref_world`, `geometry_msgs/msg/PointStamped`).
+This synchronized point remains the tractor reference used for start-line distance
+and ROI lifecycle logic; it is no longer the primary row-endpoint orientation reference.
+If the ROI marker has not arrived, endpoint orientation temporarily falls back to this point.
 Both inputs must use the `world` frame. Either message can arrive first; each
 stream buffers up to `row_start_ref_queue_size` messages (default 100), evicting
 the oldest arrivals when full. There is no fallback to a fixed or latest reference.
-Record/replay the reference topic alongside `/pcl_world_fov`; older recordings
+Record/replay the reference topic alongside `/pcl_world_roi`; older recordings
 without it need to be reprocessed from the rear-axle cloud and pose streams.
 
 ## Main interfaces
 
 ```mermaid
 flowchart TB
-    IN[Input topic\n/pcl_world_fov\nPointCloud2]
+    IN[Input topic\n/pcl_world_roi\nPointCloud2]
     NODE[path_pipeline_node]
     OUT1[Output topic\n/pernav/paths\nPoseArray start poses]
     OUT2[Output topic\n/pernav/path_markers\nMarkerArray]
+    OUT4[Output topic\n/pernav/detected_row_markers\nMarkerArray]
     OUT3[Output topic\n/pernav/group_start_line_distance\nFloat64 metres]
     REF[Input topic\n/pernav/row_start_ref_world\nPointStamped]
     REF --> NODE
     IN --> NODE --> OUT1
     NODE --> OUT2
+    NODE --> OUT4
     NODE --> OUT3
 ```
 
@@ -105,9 +113,14 @@ path searches. The node republishes the last nonempty confirmed path set and its
 group start lines while the reference-to-line distance continues updating. This
 stop is latched: moving above the threshold does not restart detection. A node
 restart, backward timestamp, or `/pernav/path_pipeline_reset` event clears the
-latch and cached geometry. The FOV node sends that event when an armed group-start
+latch and cached geometry. The ROI node sends that event when an armed group-start
 distance rises through its `5.0 m` deactivation threshold. This permits the next
-FOV cycle to detect and track a fresh set of paths.
+ROI cycle to detect and track a fresh set of paths.
+
+`/pernav/detected_row_markers` publishes one world-frame `LINE_STRIP` for every
+row accepted in the current synchronized frame. Row IDs are local to that frame;
+rows are not tracked or retained across scans. Marker lifetime uses
+`marker_lifetime_sec`, and the topic is cleared on a path-pipeline cycle reset.
 
 ## Where to tune parameters
 
@@ -128,7 +141,7 @@ Most important groups:
 | --- | ---: | --- |
 | `enable_group_start_distance_stop` | `true` | Enable the latched falling-threshold detection stop |
 | `group_start_distance_stop_threshold` | `0.2` m | Stop after distance moves from above to at or below this value |
-| `path_pipeline_reset_topic` | `/pernav/path_pipeline_reset` | Completed-FOV event that clears all per-cycle detection state |
+| `path_pipeline_reset_topic` | `/pernav/path_pipeline_reset` | Completed-ROI event that clears all per-cycle detection state |
 
 ## Persistent path starts
 
@@ -151,7 +164,15 @@ mean_y += (detected_y - mean_y) / count
 
 Only X/Y are averaged. Z remains zero in the PoseArray. The current corrected
 path segment is translated to start at the average, preserving its current heading
-and length. Group entrance lines are fitted again using these averaged starts.
+and length.
+
+The group entrance line uses all confirmed historical starts in the current ROI
+cycle, including paths missing from the current scan. Candidate lines are fitted
+from the anchors and must be within `group_angle_thresh_deg` of the frozen
+end-of-row centerline received on `/roi_markers`. Candidates are ranked first by
+anchor and observation support; equal-support candidates are ranked by perpendicular
+distance to the EOR line. A stronger candidate must persist for several frames
+before replacing the active line.
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
@@ -161,11 +182,20 @@ and length. Group entrance lines are fitted again using these averaged starts.
 | `tracking_min_observations` | `3` | Observations needed before a new track is published; 1 publishes immediately |
 | `tracking_candidate_max_missed_scans` | `5` | Discard tentative tracks after more than this many consecutive missed scans |
 | `tracking_ambiguity_margin` | `0.15` m | Withhold competing matches closer than this cost difference; 0 disables this check |
+| `start_line_eor_marker_topic` | `/roi_markers` | Frozen ROI marker supplying the expected start-line direction |
+| `start_line_residual_threshold` | `0.5` m | Maximum perpendicular residual for anchors in one line candidate |
+| `start_line_min_anchors` | `2` | Confirmed historical starts required to publish a line |
+| `start_line_switch_confirmations` | `5` | Consecutive stronger-candidate frames required before replacing the active line |
 
 Missing confirmed paths keep their averages and counts internally, but only
 confirmed paths observed in the current scan are published. A scan without
 confirmed matches publishes an empty PoseArray. The observation count increases
 only for matched detections, never for misses.
+
+Close detections still update one cumulative averaged start. If separate tracks
+nevertheless produce averaged entrances within `tracking_max_distance`, only the
+track closest to the frozen EOR line is retained; observation count and track ID
+break exact distance ties.
 
 The live plot and video draw **all stored confirmed starts as green dots**, even
 when a path is missing or the filtered cloud is empty. Missing paths retain their
@@ -179,8 +209,9 @@ labels and `n=<observation count>`; path RViz marker IDs use the same persistent
 The PoseArray is sorted by track ID, but **does not carry IDs**: its array index
 must not be treated as a persistent identity when paths appear or disappear.
 
-Tracking state is held in memory. Restarting the node or receiving a backward
-scan timestamp resets it, allowing a new bag replay to start fresh. Duplicate
+Tracking and start-line state are held in memory and clear on
+`/pernav/path_pipeline_reset`. Restarting the node or receiving a backward scan
+timestamp also resets them, allowing a new bag replay to start fresh. Duplicate
 consecutive timestamps do not count twice. Start a new node for a different field
 or world origin. Thresholds are initial tuning values: keep the distance limit
 below neighboring-path spacing while allowing expected detection noise. Changes
@@ -212,7 +243,7 @@ recorded frame count divided by `plot_video_fps`. For 10 Hz scans and every 10th
 scan, 1 fps is approximately real-time. For every scan at 10 Hz, use
 `plot_every_n_frames: 1` and `plot_video_fps: 10.0`. Pauses or gaps in incoming
 messages do not add frames. Recording starts only once synchronized clouds reach
-the plotting stage (after the frozen FOV activates).
+the plotting stage (after the frozen ROI activates).
 
 Stop the node normally with **Ctrl+C** to finalize the MP4. The node logs the saved
 path and frame count. A run with no rendered frames creates no video. FFmpeg must
@@ -261,6 +292,7 @@ ros2 node list
 ros2 topic list
 ros2 topic hz /pernav/paths
 ros2 topic hz /pernav/path_markers
+ros2 topic hz /pernav/detected_row_markers
 ros2 topic echo /pernav/group_start_line_distance
 ```
 
