@@ -52,6 +52,26 @@ Create and apply the frozen ROI:
 ros2 run pernav_world_transform roi_filter_node
 ```
 
+### Visualize the LiDAR FOV on `/pcl_prep`
+
+Run this separately to publish two orange 110-degree (±55-degree) border rays in
+the exact frame and timestamp of every `/pcl_prep` cloud, plus a world-frame
+copy transformed with the closest `/pose_rearAxle2worldGNSS` pose:
+
+```bash
+ros2 run pernav_world_transform fov_marker_node
+```
+
+In RViz, add `Marker` displays for `/pernav/lidar_fov_marker` (raw cloud frame)
+and `/pernav/lidar_fov_marker_world` (`world` frame). The border rays assume the
+sensor faces `+X` and `+Y` is left. They only visualize the border; they do not
+modify `/pcl_prep`. The default range is 20 m. Override it, for
+example, with:
+
+```bash
+ros2 run pernav_world_transform fov_marker_node --ros-args -p range_m:=30.0
+```
+
 Play the sample bag in another terminal:
 
 ```bash
@@ -106,6 +126,12 @@ ros2 run pernav_world_transform rearaxle_to_world_node --ros-args \
 | `enable_chassis_exclusion` | `false` | Remove the tractor chassis XY box before transformation |
 | `chassis_exclusion_x_min`, `chassis_exclusion_x_max` | `0.0`, `4.0` | Chassis X bounds in metres; boundary points are removed |
 | `chassis_exclusion_y_min`, `chassis_exclusion_y_max` | `-1.0`, `1.0` | Chassis Y bounds in metres; boundary points are removed |
+| `enable_chassis_front_marker` | `true` | Publish the chassis exclusion box's front-centre marker while exclusion is enabled |
+| `chassis_front_marker_topic` | `/pernav/chassis_front_marker` | Front marker in the `/pcl_prep` frame |
+| `chassis_front_marker_world_topic` | `/pernav/chassis_front_marker_world` | Same marker transformed into `world` |
+
+When chassis exclusion is enabled, the marker is a red sphere at the front
+centre of the excluded rectangle: `(chassis_exclusion_x_max, midpoint(y_min, y_max), 0)`.
 
 These filter parameters moved from `pernav_path_node` to this node. Their bounds are
 relative to the rear axle, and Z is preserved. With both filters disabled, all finite

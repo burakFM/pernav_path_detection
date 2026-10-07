@@ -51,12 +51,23 @@ def generate_launch_description():
         ),
         Node(
             package='pernav_world_transform',
+            executable='fov_marker_node',
+            output='screen',
+            parameters=[{{
+                'input_pointcloud_topic': '/pcl_prep',
+                'marker_topic': '/pernav/lidar_fov_marker',
+                'fov_degrees': 110.0,
+                'range_m': 20.0,
+            }}],
+        ),
+        Node(
+            package='pernav_world_transform',
             executable='roi_filter_node',
             output='screen',
             parameters=[{{
                 'activation_distance': 1.0,
                 'distance_message_type': '{distance_message_type}',
-                'roi_line_extension': 10.0,
+                'roi_line_extension': 15.0,
                 'group_start_near_threshold': 0.2,
                 'deactivation_distance': 5.0,
                 'eor_deactivation_distance': 10.0,

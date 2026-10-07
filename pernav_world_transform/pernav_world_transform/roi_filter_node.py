@@ -436,9 +436,9 @@ class RoiFilterNode(Node):
         marker.action = Marker.ADD
         marker.pose.orientation.w = 1.0
         marker.scale.x = 0.06
-        marker.color.r = 0.1
-        marker.color.g = 0.9
-        marker.color.b = 0.2
+        marker.color.r = 0.75
+        marker.color.g = 0.1
+        marker.color.b = 0.9
         marker.color.a = 1.0
         marker.lifetime.sec = 0
         marker.points = [

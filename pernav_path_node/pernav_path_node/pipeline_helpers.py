@@ -77,6 +77,8 @@ def detect_rows_count(
     max_rows: int,
     remove_radius: float,
     min_points_left: int,
+    eor_line_reference: tuple[float, float],
+    eor_line_direction: tuple[float, float],
 ) -> int:
     """Iteratively detect and remove row-like line segments; return detected row count."""
     row_records = detect_rows_from_xy(
@@ -87,8 +89,9 @@ def detect_rows_count(
         min_segment_inliers=min_segment_inliers,
         max_rows=max_rows,
         remove_radius=remove_radius,
-        start_ref_point=(3.0, 0.0),
         min_points_left=min_points_left,
+        eor_line_reference=eor_line_reference,
+        eor_line_direction=eor_line_direction,
     )
     return len(row_records)
 
@@ -101,34 +104,29 @@ def detect_rows_from_xy(
     min_segment_inliers: int,
     max_rows: int,
     remove_radius: float,
-    start_ref_point: tuple[float, float],
     min_points_left: int,
-    eor_line_reference: tuple[float, float] | None = None,
-    eor_line_direction: tuple[float, float] | None = None,
+    eor_line_reference: tuple[float, float],
+    eor_line_direction: tuple[float, float],
 ) -> list[dict]:
-    """Detect row segments and return notebook-style row metadata records."""
+    """Detect row segments oriented with their starts nearest the EOR line."""
     if xy.size == 0:
         return []
 
     working_points = xy.copy()
     row_records: list[dict] = []
-    ref_point = np.array(start_ref_point, dtype=float)
-    eor_reference = None
-    eor_normal = None
-    if eor_line_reference is not None and eor_line_direction is not None:
-        candidate_reference = np.asarray(eor_line_reference, dtype=float)
-        candidate_direction = np.asarray(eor_line_direction, dtype=float)
-        direction_length = float(np.linalg.norm(candidate_direction))
-        if (
-            candidate_reference.shape == (2,)
-            and candidate_direction.shape == (2,)
-            and np.isfinite(candidate_reference).all()
-            and np.isfinite(candidate_direction).all()
-            and direction_length > 1e-9
-        ):
-            candidate_direction /= direction_length
-            eor_reference = candidate_reference
-            eor_normal = np.array([-candidate_direction[1], candidate_direction[0]], dtype=float)
+    eor_reference = np.asarray(eor_line_reference, dtype=float)
+    eor_direction = np.asarray(eor_line_direction, dtype=float)
+    direction_length = float(np.linalg.norm(eor_direction))
+    if (
+        eor_reference.shape != (2,)
+        or eor_direction.shape != (2,)
+        or not np.isfinite(eor_reference).all()
+        or not np.isfinite(eor_direction).all()
+        or direction_length <= 1e-9
+    ):
+        return []
+    eor_direction /= direction_length
+    eor_normal = np.array([-eor_direction[1], eor_direction[0]], dtype=float)
 
     for _ in range(max_rows):
         line_k, inlier_mask_k = ransac_line_2d_continuous(
@@ -156,12 +154,9 @@ def detect_rows_from_xy(
         p_start = line_org + t_min * line_dir
         p_end = line_org + t_max * line_dir
 
-        if eor_reference is not None and eor_normal is not None:
-            start_distance = abs(float((p_start - eor_reference) @ eor_normal))
-            end_distance = abs(float((p_end - eor_reference) @ eor_normal))
-            if start_distance > end_distance:
-                p_start, p_end = p_end, p_start
-        elif np.linalg.norm(p_start - ref_point) > np.linalg.norm(p_end - ref_point):
+        start_distance = abs(float((p_start - eor_reference) @ eor_normal))
+        end_distance = abs(float((p_end - eor_reference) @ eor_normal))
+        if start_distance > end_distance:
             p_start, p_end = p_end, p_start
 
         row_records.append(
@@ -191,54 +186,63 @@ def detect_rows_from_xy(
 
 def build_paths_from_rows(
     row_records: list[dict],
-    path_width: float,
     min_path_length: float = 0.0,
 ) -> list[dict]:
-    """Build path metadata from row pairs whose starts are closer than path_width."""
+    """Build paths only between rows from consecutive ROI strips.
+
+    The row detector keeps at most one row per strip. The ordered strip IDs
+    therefore define physical adjacency: a row in strip ``i`` may only pair
+    with a row in strip ``i + 1``. Missing strips intentionally leave a gap
+    rather than creating a path across it.
+    """
     if not row_records:
         return []
 
     path_records: list[dict] = []
 
-    for i in range(len(row_records)):
-        for j in range(i + 1, len(row_records)):
-            row_i = row_records[i]
-            row_j = row_records[j]
+    rows_by_strip: dict[int, dict] = {}
+    for row in row_records:
+        strip_id = row.get('roi_strip_id')
+        if isinstance(strip_id, (int, np.integer)) and strip_id > 0:
+            rows_by_strip[int(strip_id)] = row
 
-            start_i = np.array([row_i['start_x'], row_i['start_y']], dtype=float)
-            start_j = np.array([row_j['start_x'], row_j['start_y']], dtype=float)
-            row_spacing = float(np.linalg.norm(start_i - start_j))
+    for strip_id in sorted(rows_by_strip):
+        row_i = rows_by_strip[strip_id]
+        row_j = rows_by_strip.get(strip_id + 1)
+        if row_j is None:
+            continue
 
-            if row_spacing >= path_width:
-                continue
+        start_i = np.array([row_i['start_x'], row_i['start_y']], dtype=float)
+        start_j = np.array([row_j['start_x'], row_j['start_y']], dtype=float)
+        row_spacing = float(np.linalg.norm(start_i - start_j))
 
-            end_i = np.array([row_i['end_x'], row_i['end_y']], dtype=float)
-            end_j = np.array([row_j['end_x'], row_j['end_y']], dtype=float)
+        end_i = np.array([row_i['end_x'], row_i['end_y']], dtype=float)
+        end_j = np.array([row_j['end_x'], row_j['end_y']], dtype=float)
 
-            p_start = 0.5 * (start_i + start_j)
-            p_end = 0.5 * (end_i + end_j)
-            path_len = float(np.linalg.norm(p_end - p_start))
+        p_start = 0.5 * (start_i + start_j)
+        p_end = 0.5 * (end_i + end_j)
+        path_len = float(np.linalg.norm(p_end - p_start))
 
-            if path_len < min_path_length:
-                continue
+        if path_len < min_path_length:
+            continue
 
-            path_records.append(
-                {
-                    'path_id': len(path_records) + 1,
-                    'row_a_id': int(row_i['row_id']),
-                    'row_b_id': int(row_j['row_id']),
-                    'row_a_start_x': float(start_i[0]),
-                    'row_a_start_y': float(start_i[1]),
-                    'row_b_start_x': float(start_j[0]),
-                    'row_b_start_y': float(start_j[1]),
-                    'path_start_x': float(p_start[0]),
-                    'path_start_y': float(p_start[1]),
-                    'path_end_x': float(p_end[0]),
-                    'path_end_y': float(p_end[1]),
-                    'path_length': path_len,
-                    'row_spacing': row_spacing,
-                }
-            )
+        path_records.append(
+            {
+                'path_id': len(path_records) + 1,
+                'row_a_id': int(row_i['row_id']),
+                'row_b_id': int(row_j['row_id']),
+                'row_a_start_x': float(start_i[0]),
+                'row_a_start_y': float(start_i[1]),
+                'row_b_start_x': float(start_j[0]),
+                'row_b_start_y': float(start_j[1]),
+                'path_start_x': float(p_start[0]),
+                'path_start_y': float(p_start[1]),
+                'path_end_x': float(p_end[0]),
+                'path_end_y': float(p_end[1]),
+                'path_length': path_len,
+                'row_spacing': row_spacing,
+            }
+        )
 
     return path_records
 

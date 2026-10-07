@@ -32,7 +32,8 @@ flowchart LR
     S --> B[Parse XYZ]
     B --> C[Project to XY]
     C --> D[Row detection RANSAC]
-    D --> E[Build center paths]
+    D --> X[Discard starts < 1 m from FOV boundary]
+    X --> E[Build center paths]
     E --> F[Group paths]
     F --> G[Parallel correction]
     G --> T[Match persistent paths and average start XY]
@@ -55,7 +56,8 @@ flowchart LR
 3. Run continuous-row RANSAC independently in each strip, then combine and
     renumber the detected rows. The endpoint with the
     smaller perpendicular distance to the frozen EOR line becomes the row start.
-4. Pair nearby rows to create center paths.
+4. Pair rows from consecutive ROI strips to create center paths; a missing
+   strip leaves a gap rather than creating a path across it.
 5. Group paths by angle and distance.
 6. Use the longest path per group as reference and align others in parallel.
 7. Match corrected paths across scans and update their running mean start X/Y.
@@ -74,8 +76,8 @@ The rear-axle reference parameters `row_start_ref_x/y` now belong to
 `rearaxle_to_world_node`. This node subscribes to `row_start_ref_topic`
 (default `/pernav/row_start_ref_world`, `geometry_msgs/msg/PointStamped`).
 This synchronized point remains the tractor reference used for start-line distance
-and ROI lifecycle logic; it is no longer the primary row-endpoint orientation reference.
-If the ROI marker has not arrived, endpoint orientation temporarily falls back to this point.
+and ROI lifecycle logic; it is not used to orient row endpoints. Row detection waits
+for the frozen EOR marker and always orients row starts toward that line.
 Both inputs must use the `world` frame. Either message can arrive first; each
 stream buffers up to `row_start_ref_queue_size` messages (default 100), evicting
 the oldest arrivals when full. There is no fallback to a fixed or latest reference.
@@ -117,8 +119,19 @@ latch and cached geometry. The ROI node sends that event when an armed group-sta
 distance rises through its `5.0 m` deactivation threshold. This permits the next
 ROI cycle to detect and track a fresh set of paths.
 
+When a synchronized `/pernav/chassis_front_marker_world` and one or more published
+paths are available, `/pernav/chassis_front_to_path_entrance_distance` publishes the
+shortest XY distance in metres from the chassis front to a path entrance. The purple
+`/pernav/chassis_front_path_distance_marker` line identifies the entrance selected.
+For synchronized RViz inspection, add a `MarkerArray` display for
+`/pernav/chassis_front_path_distance_markers`: each message contains both the
+smaller red chassis-front sphere and its corresponding purple distance line.
+
 `/pernav/detected_row_markers` publishes one world-frame `LINE_STRIP` for every
-row accepted in the current synchronized frame. Row IDs are local to that frame;
+row accepted for path construction in the current synchronized frame. Rows rejected
+because their EOR-oriented start is closer than `fov_boundary_min_distance_m` to a
+world FOV boundary ray are published in red on `/pernav/discarded_fov_row_markers`.
+Row IDs are local to that frame;
 rows are not tracked or retained across scans. Marker lifetime uses
 `marker_lifetime_sec`, and the topic is cleared on a path-pipeline cycle reset.
 
