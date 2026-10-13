@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, PointStamped, Pose, PoseArray
+from geometry_msgs.msg import Point, Pose, PoseArray
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Empty, Float64
@@ -44,8 +44,7 @@ class PathPipelineNode(Node):
             namespace='',
             parameters=[
                 ('input_topic', '/pcl_world_roi'),
-                ('row_start_ref_topic', '/pernav/row_start_ref_world'),
-                ('row_start_ref_queue_size', 100),
+                ('sync_queue_size', 100),
                 ('roi_axes_marker_topic', '/roi_markers_axes'),
                 ('enable_roi_strip_detection', True),
                 ('enable_fov_boundary_row_filter', False),
@@ -53,15 +52,9 @@ class PathPipelineNode(Node):
                 ('fov_boundary_min_distance_m', 1.0),
                 ('enable_discarded_fov_row_marker_publisher', True),
                 ('discarded_fov_row_marker_topic', '/pernav/discarded_fov_row_markers'),
-                ('enable_chassis_front_path_distance_publisher', True),
-                ('chassis_front_marker_world_topic', '/pernav/chassis_front_marker_world'),
-                ('chassis_front_path_distance_topic', '/pernav/chassis_front_to_path_entrance_distance'),
-                ('chassis_front_path_distance_marker_topic', '/pernav/chassis_front_path_distance_marker'),
-                ('chassis_front_path_distance_markers_topic', '/pernav/chassis_front_path_distance_markers'),
-                ('enable_geometric_path_experiment', True),
-                ('geometric_path_length', 3.0),
-                ('geometric_path_output_topic', '/pernav/geometric_paths'),
-                ('geometric_marker_output_topic', '/pernav/geometric_path_markers'),
+                ('enable_rear_axle_path_distance_publisher', True),
+                ('rear_axle_marker_world_topic', '/pernav/rear_axle_marker_world'),
+                ('rear_axle_path_distance_topic', '/pernav/rear_axle_to_path_entrance_distance'),
                 ('enable_row_detection', True),
                 ('row_distance_threshold', 0.2),
                 ('row_max_gap', 0.6),
@@ -111,25 +104,22 @@ class PathPipelineNode(Node):
                 ('enable_group_start_distance_publisher', True),
                 ('group_start_distance_topic', '/pernav/group_start_line_distance'),
                 ('enable_group_start_distance_stop', True),
-                ('group_start_distance_stop_threshold', 0.2),
+                ('group_start_distance_stop_threshold', 2.0),
                 ('path_pipeline_reset_topic', '/pernav/path_pipeline_reset'),
             ],
         )
 
         self.input_topic = self.get_parameter('input_topic').value
-        self.row_start_ref_topic = str(self.get_parameter('row_start_ref_topic').value)
-        self.row_start_ref_queue_size = max(1, int(self.get_parameter('row_start_ref_queue_size').value))
+        self.sync_queue_size = max(1, int(self.get_parameter('sync_queue_size').value))
         self.roi_axes_marker_topic = str(self.get_parameter('roi_axes_marker_topic').value)
         self.enable_roi_strip_detection = bool(
             self.get_parameter('enable_roi_strip_detection').value
         )
         self._pending_clouds: OrderedDict[tuple[int, int], PointCloud2] = OrderedDict()
-        self._pending_references: OrderedDict[tuple[int, int], PointStamped] = OrderedDict()
         self._pending_fov_markers: OrderedDict[tuple[int, int], Marker] = OrderedDict()
-        self._pending_chassis_front_markers: OrderedDict[tuple[int, int], Marker] = OrderedDict()
+        self._pending_rear_axle_markers: OrderedDict[tuple[int, int], Marker] = OrderedDict()
         self._roi_strip_normal: np.ndarray | None = None
         self._roi_strip_boundaries: np.ndarray | None = None
-        self._roi_driving_direction: np.ndarray | None = None
         self.enable_fov_boundary_row_filter = bool(
             self.get_parameter('enable_fov_boundary_row_filter').value
         )
@@ -150,33 +140,15 @@ class PathPipelineNode(Node):
             or self.fov_boundary_min_distance_m < 0.0
         ):
             raise ValueError('FOV boundary minimum distance must be finite and nonnegative.')
-        self.enable_chassis_front_path_distance_publisher = bool(
-            self.get_parameter('enable_chassis_front_path_distance_publisher').value
+        self.enable_rear_axle_path_distance_publisher = bool(
+            self.get_parameter('enable_rear_axle_path_distance_publisher').value
         )
-        self.chassis_front_marker_world_topic = str(
-            self.get_parameter('chassis_front_marker_world_topic').value
+        self.rear_axle_marker_world_topic = str(
+            self.get_parameter('rear_axle_marker_world_topic').value
         )
-        self.chassis_front_path_distance_topic = str(
-            self.get_parameter('chassis_front_path_distance_topic').value
+        self.rear_axle_path_distance_topic = str(
+            self.get_parameter('rear_axle_path_distance_topic').value
         )
-        self.chassis_front_path_distance_marker_topic = str(
-            self.get_parameter('chassis_front_path_distance_marker_topic').value
-        )
-        self.chassis_front_path_distance_markers_topic = str(
-            self.get_parameter('chassis_front_path_distance_markers_topic').value
-        )
-        self.enable_geometric_path_experiment = bool(
-            self.get_parameter('enable_geometric_path_experiment').value
-        )
-        self.geometric_path_length = float(self.get_parameter('geometric_path_length').value)
-        self.geometric_path_output_topic = str(
-            self.get_parameter('geometric_path_output_topic').value
-        )
-        self.geometric_marker_output_topic = str(
-            self.get_parameter('geometric_marker_output_topic').value
-        )
-        if not math.isfinite(self.geometric_path_length) or self.geometric_path_length <= 0.0:
-            raise ValueError('Geometric path length must be finite and positive.')
         self.enable_row_detection = bool(self.get_parameter('enable_row_detection').value)
         self.row_distance_threshold = float(self.get_parameter('row_distance_threshold').value)
         self.row_max_gap = float(self.get_parameter('row_max_gap').value)
@@ -193,15 +165,6 @@ class PathPipelineNode(Node):
             max_heading_deg=float(self.get_parameter('tracking_max_heading_deg').value),
             min_observations=int(self.get_parameter('tracking_min_observations').value),
             candidate_max_missed_scans=int(self.get_parameter('tracking_candidate_max_missed_scans').value),
-            ambiguity_margin=float(self.get_parameter('tracking_ambiguity_margin').value),
-        )
-        self.geometric_path_start_tracker = PathStartTracker(
-            max_distance=float(self.get_parameter('tracking_max_distance').value),
-            max_heading_deg=float(self.get_parameter('tracking_max_heading_deg').value),
-            min_observations=int(self.get_parameter('tracking_min_observations').value),
-            candidate_max_missed_scans=int(
-                self.get_parameter('tracking_candidate_max_missed_scans').value
-            ),
             ambiguity_margin=float(self.get_parameter('tracking_ambiguity_margin').value),
         )
         self.enable_parallel_correction = bool(self.get_parameter('enable_parallel_correction').value)
@@ -235,13 +198,6 @@ class PathPipelineNode(Node):
             self.get_parameter('start_line_eor_marker_topic').value
         )
         self.start_line_tracker = StartLineTracker(
-            residual_threshold=float(self.get_parameter('start_line_residual_threshold').value),
-            min_anchors=int(self.get_parameter('start_line_min_anchors').value),
-            switch_confirmations=int(self.get_parameter('start_line_switch_confirmations').value),
-            extension_m=self.start_line_extension_m,
-            max_eor_angle_deg=float(self.get_parameter('group_angle_thresh_deg').value),
-        )
-        self.geometric_start_line_tracker = StartLineTracker(
             residual_threshold=float(self.get_parameter('start_line_residual_threshold').value),
             min_anchors=int(self.get_parameter('start_line_min_anchors').value),
             switch_confirmations=int(self.get_parameter('start_line_switch_confirmations').value),
@@ -283,12 +239,6 @@ class PathPipelineNode(Node):
 
         self.path_publisher = self.create_publisher(PoseArray, self.path_output_topic, 10)
         self.marker_publisher = self.create_publisher(MarkerArray, self.marker_output_topic, 10)
-        self.geometric_path_publisher = self.create_publisher(
-            PoseArray, self.geometric_path_output_topic, 10,
-        )
-        self.geometric_marker_publisher = self.create_publisher(
-            MarkerArray, self.geometric_marker_output_topic, 10,
-        )
         self.row_marker_publisher = self.create_publisher(
             MarkerArray, self.row_marker_output_topic, 10,
         )
@@ -298,14 +248,8 @@ class PathPipelineNode(Node):
         self.group_start_distance_publisher = self.create_publisher(
             Float64, self.group_start_distance_topic, 10,
         )
-        self.chassis_front_path_distance_publisher = self.create_publisher(
-            Float64, self.chassis_front_path_distance_topic, 10,
-        )
-        self.chassis_front_path_distance_marker_publisher = self.create_publisher(
-            Marker, self.chassis_front_path_distance_marker_topic, 10,
-        )
-        self.chassis_front_path_distance_markers_publisher = self.create_publisher(
-            MarkerArray, self.chassis_front_path_distance_markers_topic, 10,
+        self.rear_axle_path_distance_publisher = self.create_publisher(
+            Float64, self.rear_axle_path_distance_topic, 10,
         )
 
         if self.enable_notebook_plot or self.enable_plot_video:
@@ -318,12 +262,6 @@ class PathPipelineNode(Node):
             10,
         )
         self.subscription
-        self.row_start_ref_subscription = self.create_subscription(
-            PointStamped,
-            self.row_start_ref_topic,
-            self.row_start_ref_callback,
-            10,
-        )
         self.path_pipeline_reset_subscription = self.create_subscription(
             Empty,
             self.path_pipeline_reset_topic,
@@ -348,24 +286,22 @@ class PathPipelineNode(Node):
             self.fov_boundary_marker_callback,
             10,
         )
-        self.chassis_front_marker_subscription = self.create_subscription(
+        self.rear_axle_marker_subscription = self.create_subscription(
             Marker,
-            self.chassis_front_marker_world_topic,
-            self.chassis_front_marker_callback,
+            self.rear_axle_marker_world_topic,
+            self.rear_axle_marker_callback,
             10,
         )
         self.get_logger().info(
             f'Path pipeline node listening on topic {self.input_topic} '
-            f'| synchronized_reference={self.row_start_ref_topic} '
+            f'| synchronized_rear_axle={self.rear_axle_marker_world_topic} '
             f'| row_detection={self.enable_row_detection} '
             f'| roi_strip_detection={self.enable_roi_strip_detection} '
             f'({self.roi_axes_marker_topic}) '
             f'| fov_boundary_row_filter={self.enable_fov_boundary_row_filter} '
             f'({self.fov_boundary_marker_topic}, minimum={self.fov_boundary_min_distance_m} m) '
-            f'| chassis_front_path_distance={self.enable_chassis_front_path_distance_publisher} '
-            f'({self.chassis_front_path_distance_topic}) '
-            f'| geometric_path_experiment={self.enable_geometric_path_experiment} '
-            f'({self.geometric_path_output_topic}) '
+            f'| rear_axle_path_distance={self.enable_rear_axle_path_distance_publisher} '
+            f'({self.rear_axle_path_distance_topic}) '
             f'| path_detection={self.enable_path_detection} '
             f'| path_start_tracking={self.enable_path_start_tracking} '
             f'| parallel_correction={self.enable_parallel_correction} '
@@ -442,7 +378,7 @@ class PathPipelineNode(Node):
 
     def _publish_group_start_distance(
         self,
-        reference: PointStamped,
+        rear_axle_marker: Marker,
         current_lines: list[dict],
         stamp_ns: int,
     ) -> float | None:
@@ -459,7 +395,10 @@ class PathPipelineNode(Node):
         if not self._retained_group_start_lines:
             return None
 
-        reference_xy = np.array([reference.point.x, reference.point.y], dtype=float)
+        reference_xy = np.array([
+            rear_axle_marker.pose.position.x,
+            rear_axle_marker.pose.position.y,
+        ], dtype=float)
         distance = min(
             self._point_to_segment_distance(reference_xy, line)
             for line in self._retained_group_start_lines.values()
@@ -489,13 +428,10 @@ class PathPipelineNode(Node):
         self._last_confirmed_group_start_lines.clear()
         self.path_start_tracker.reset()
         self.start_line_tracker.reset()
-        self.geometric_path_start_tracker.reset()
-        self.geometric_start_line_tracker.reset()
         self._eor_line_reference = None
         self._eor_line_direction = None
         self._roi_strip_normal = None
         self._roi_strip_boundaries = None
-        self._roi_driving_direction = None
 
     def eor_line_marker_callback(self, marker: Marker) -> None:
         """Store the frozen ROI centerline direction as the start-line orientation prior."""
@@ -521,7 +457,6 @@ class PathPipelineNode(Node):
         if marker.action == Marker.DELETE or marker.action == Marker.DELETEALL:
             self._roi_strip_normal = None
             self._roi_strip_boundaries = None
-            self._roi_driving_direction = None
             return
         if (
             marker.ns != 'world_roi_axes'
@@ -550,48 +485,6 @@ class PathPipelineNode(Node):
             return
         self._roi_strip_normal = normal
         self._roi_strip_boundaries = np.sort(boundaries)
-        self._roi_driving_direction = direction
-
-    def _build_geometric_paths(self, xy_roi: np.ndarray) -> tuple[list[np.ndarray], list[dict]]:
-        """Build fixed-length reverse-driving paths from EOR-nearest strip points."""
-        if (
-            not self.enable_geometric_path_experiment
-            or self._roi_strip_normal is None
-            or self._roi_strip_boundaries is None
-            or self._roi_driving_direction is None
-            or self._eor_line_reference is None
-            or self._eor_line_direction is None
-        ):
-            return [], []
-
-        coordinates = xy_roi @ self._roi_strip_normal
-        eor_normal = np.array(
-            [-self._eor_line_direction[1], self._eor_line_direction[0]], dtype=float,
-        )
-        row_starts: list[np.ndarray] = []
-        for lower, upper in zip(self._roi_strip_boundaries[:-1], self._roi_strip_boundaries[1:]):
-            region = xy_roi[(coordinates >= lower) & (coordinates < upper)]
-            if region.size == 0:
-                continue
-            eor_distances = np.abs((region - self._eor_line_reference) @ eor_normal)
-            row_starts.append(region[int(np.argmin(eor_distances))].copy())
-
-        path_direction = -self._roi_driving_direction
-        path_records: list[dict] = []
-        for path_id, (first_start, second_start) in enumerate(
-            zip(row_starts[:-1], row_starts[1:]), start=1,
-        ):
-            entrance = 0.5 * (first_start + second_start)
-            end = entrance + self.geometric_path_length * path_direction
-            path_records.append({
-                'path_id': path_id,
-                'path_start_x': float(entrance[0]),
-                'path_start_y': float(entrance[1]),
-                'path_end_x': float(end[0]),
-                'path_end_y': float(end[1]),
-            })
-        return row_starts, path_records
-
     def _detect_rows_in_roi_strips(
         self,
         xy_roi: np.ndarray,
@@ -647,26 +540,13 @@ class PathPipelineNode(Node):
         """Clear all state belonging to the completed ROI cycle."""
         self._clear_path_pipeline_cycle_state()
         self._pending_clouds.clear()
-        self._pending_references.clear()
+        self._pending_rear_axle_markers.clear()
 
         if self.enable_path_publisher:
             paths = PoseArray()
             paths.header.frame_id = 'world'
             paths.header.stamp = self.get_clock().now().to_msg()
             self.path_publisher.publish(paths)
-
-        geometric_paths = PoseArray()
-        geometric_paths.header.frame_id = 'world'
-        geometric_paths.header.stamp = self.get_clock().now().to_msg()
-        self.geometric_path_publisher.publish(geometric_paths)
-
-        delete_all = Marker()
-        delete_all.header.frame_id = 'world'
-        delete_all.header.stamp = self.get_clock().now().to_msg()
-        delete_all.action = Marker.DELETEALL
-        geometric_markers = MarkerArray()
-        geometric_markers.markers.append(delete_all)
-        self.geometric_marker_publisher.publish(geometric_markers)
 
         if self.enable_marker_publisher:
             delete_all = Marker()
@@ -907,9 +787,9 @@ class PathPipelineNode(Node):
             marker.pose.position.y = float(rec['path_start_y'])
             marker.pose.position.z = 0.08
             marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.25
-            marker.scale.y = 0.25
-            marker.scale.z = 0.25
+            marker.scale.x = 0.10
+            marker.scale.y = 0.10
+            marker.scale.z = 0.10
             marker.color.r = 1.0
             marker.color.g = 1.0
             marker.color.b = 0.0
@@ -1036,64 +916,25 @@ class PathPipelineNode(Node):
         self.discarded_fov_row_marker_publisher.publish(marker_array)
         return len(marker_array.markers)
 
-    def _publish_chassis_front_path_distance(
-        self, src_msg: PointCloud2, chassis_front_marker: Marker, path_records: list[dict],
+    def _publish_rear_axle_path_distance(
+        self, rear_axle_marker: Marker, path_records: list[dict],
     ) -> float | None:
-        """Publish the XY distance from the chassis front to the nearest path entrance."""
+        """Publish the XY distance from the rear axle to the nearest path entrance."""
         if not path_records:
             return None
-        front = np.array([
-            chassis_front_marker.pose.position.x,
-            chassis_front_marker.pose.position.y,
+        rear_axle = np.array([
+            rear_axle_marker.pose.position.x,
+            rear_axle_marker.pose.position.y,
         ], dtype=float)
         closest = min(
             path_records,
-            key=lambda record: float(np.linalg.norm(front - np.array([
+            key=lambda record: float(np.linalg.norm(rear_axle - np.array([
                 record['path_start_x'], record['path_start_y'],
             ], dtype=float))),
         )
         entrance = np.array([closest['path_start_x'], closest['path_start_y']], dtype=float)
-        distance = float(np.linalg.norm(front - entrance))
-        self.chassis_front_path_distance_publisher.publish(Float64(data=distance))
-
-        marker = Marker()
-        marker.header = src_msg.header
-        marker.ns = 'pernav_chassis_front_path_distance'
-        marker.id = 0
-        marker.type = Marker.LINE_STRIP
-        marker.action = Marker.ADD
-        # Use the marker's exact 3D centre so the line visibly starts at the
-        # red chassis-front sphere in an oblique RViz camera view.
-        z = float(chassis_front_marker.pose.position.z)
-        marker.points = [
-            Point(x=float(front[0]), y=float(front[1]), z=z),
-            Point(x=float(entrance[0]), y=float(entrance[1]), z=z),
-        ]
-        marker.scale.x = max(0.02, self.marker_line_width)
-        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.9, 0.1, 1.0, 1.0
-        marker.lifetime.sec = int(self.marker_lifetime_sec)
-        marker.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
-        self.chassis_front_path_distance_marker_publisher.publish(marker)
-
-        # Publish both elements together so RViz cannot render a chassis point
-        # from one scan with a distance line from another scan.
-        start_marker = Marker()
-        start_marker.header = src_msg.header
-        start_marker.ns = 'pernav_chassis_front_path_distance_start'
-        start_marker.id = 0
-        start_marker.type = Marker.SPHERE
-        start_marker.action = Marker.ADD
-        start_marker.pose.position.x = float(front[0])
-        start_marker.pose.position.y = float(front[1])
-        start_marker.pose.position.z = float(chassis_front_marker.pose.position.z)
-        start_marker.pose.orientation.w = 1.0
-        start_marker.scale.x = start_marker.scale.y = start_marker.scale.z = 0.20
-        start_marker.color.r, start_marker.color.g, start_marker.color.b, start_marker.color.a = 1.0, 0.0, 0.0, 1.0
-        start_marker.lifetime = marker.lifetime
-
-        synchronized_markers = MarkerArray()
-        synchronized_markers.markers = [start_marker, marker]
-        self.chassis_front_path_distance_markers_publisher.publish(synchronized_markers)
+        distance = float(np.linalg.norm(rear_axle - entrance))
+        self.rear_axle_path_distance_publisher.publish(Float64(data=distance))
         return distance
 
     def _publish_paths(self, src_msg: PointCloud2, path_records: list[dict]) -> int:
@@ -1116,96 +957,6 @@ class PathPipelineNode(Node):
 
         self.path_publisher.publish(msg)
         return len(msg.poses)
-
-    def _publish_geometric_paths(
-        self,
-        src_msg: PointCloud2,
-        path_records: list[dict],
-        start_lines: list[dict],
-    ) -> int:
-        paths_msg = PoseArray()
-        paths_msg.header = src_msg.header
-        markers = MarkerArray()
-
-        for record in path_records:
-            marker = Marker()
-            marker.header = src_msg.header
-            marker.ns = 'pernav_geometric_path_starts'
-            marker.id = int(record['path_id'])
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position.x = float(record['path_start_x'])
-            marker.pose.position.y = float(record['path_start_y'])
-            marker.pose.position.z = 0.08
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.22
-            marker.scale.y = 0.22
-            marker.scale.z = 0.22
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 1.0
-            marker.color.a = 0.95
-            marker.lifetime.sec = int(self.marker_lifetime_sec)
-            marker.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
-            markers.markers.append(marker)
-
-        for record in path_records:
-            pose = Pose()
-            pose.position.x = float(record['path_start_x'])
-            pose.position.y = float(record['path_start_y'])
-            dx = float(record['path_end_x']) - pose.position.x
-            dy = float(record['path_end_y']) - pose.position.y
-            yaw = math.atan2(dy, dx)
-            pose.orientation.z = math.sin(0.5 * yaw)
-            pose.orientation.w = math.cos(0.5 * yaw)
-            paths_msg.poses.append(pose)
-
-            marker = Marker()
-            marker.header = src_msg.header
-            marker.ns = 'pernav_geometric_paths'
-            marker.id = int(record['path_id'])
-            marker.type = Marker.LINE_STRIP
-            marker.action = Marker.ADD
-            marker.points = [
-                Point(x=pose.position.x, y=pose.position.y, z=0.05),
-                Point(
-                    x=float(record['path_end_x']),
-                    y=float(record['path_end_y']),
-                    z=0.05,
-                ),
-            ]
-            marker.scale.x = self.marker_line_width
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 1.0
-            marker.color.a = 0.95
-            marker.lifetime.sec = int(self.marker_lifetime_sec)
-            marker.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
-            markers.markers.append(marker)
-
-        for line_id, line in enumerate(start_lines, start=1):
-            marker = Marker()
-            marker.header = src_msg.header
-            marker.ns = 'pernav_geometric_sor_lines'
-            marker.id = line_id
-            marker.type = Marker.LINE_STRIP
-            marker.action = Marker.ADD
-            marker.points = [
-                Point(x=float(line['start_x']), y=float(line['start_y']), z=0.06),
-                Point(x=float(line['end_x']), y=float(line['end_y']), z=0.06),
-            ]
-            marker.scale.x = max(0.02, self.marker_line_width * 0.8)
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 1.0
-            marker.color.a = 0.95
-            marker.lifetime.sec = int(self.marker_lifetime_sec)
-            marker.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
-            markers.markers.append(marker)
-
-        self.geometric_path_publisher.publish(paths_msg)
-        self.geometric_marker_publisher.publish(markers)
-        return len(paths_msg.poses)
 
     @staticmethod
     def _pc2_to_xyz(msg: PointCloud2) -> tuple[int, np.ndarray]:
@@ -1237,13 +988,18 @@ class PathPipelineNode(Node):
         return raw_count, np.asarray(points, dtype=np.float32)
 
     def listener_callback(self, msg: PointCloud2) -> None:
-        self._queue_for_reference_sync(msg, is_cloud=True)
-
-    def row_start_ref_callback(self, msg: PointStamped) -> None:
-        if not all(math.isfinite(value) for value in (msg.point.x, msg.point.y, msg.point.z)):
-            self.get_logger().warning('Ignoring non-finite row-start reference.')
+        if msg.header.frame_id != 'world':
+            self.get_logger().warning(
+                f'Ignoring cloud in frame {msg.header.frame_id!r}; expected world.'
+            )
             return
-        self._queue_for_reference_sync(msg, is_cloud=False)
+        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        self._pending_clouds[stamp] = msg
+        self._pending_clouds.move_to_end(stamp)
+        self._try_process_synchronized_stamp(stamp)
+        while len(self._pending_clouds) > self.sync_queue_size:
+            self._pending_clouds.popitem(last=False)
+            self.get_logger().warning('Dropping cloud without a matching world rear-axle marker.')
 
     def fov_boundary_marker_callback(self, msg: Marker) -> None:
         """Buffer world FOV border rays until their matching ROI cloud arrives."""
@@ -1255,64 +1011,34 @@ class PathPipelineNode(Node):
         self._pending_fov_markers[stamp] = msg
         self._pending_fov_markers.move_to_end(stamp)
         self._try_process_synchronized_stamp(stamp)
-        while len(self._pending_fov_markers) > self.row_start_ref_queue_size:
+        while len(self._pending_fov_markers) > self.sync_queue_size:
             self._pending_fov_markers.popitem(last=False)
             self.get_logger().warning('Dropping FOV marker without a matching world ROI cloud.')
 
-    def chassis_front_marker_callback(self, msg: Marker) -> None:
-        """Buffer the front-centre marker for the matching world-frame cloud."""
-        if not self.enable_chassis_front_path_distance_publisher:
-            return
-        if msg.header.frame_id != 'world' or msg.ns != 'chassis_front_world':
+    def rear_axle_marker_callback(self, msg: Marker) -> None:
+        """Buffer the world-frame rear-axle marker for its matching ROI cloud."""
+        if msg.header.frame_id != 'world' or msg.ns != 'rear_axle_world':
             return
         stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
-        self._pending_chassis_front_markers[stamp] = msg
-        self._pending_chassis_front_markers.move_to_end(stamp)
-        while len(self._pending_chassis_front_markers) > self.row_start_ref_queue_size:
-            self._pending_chassis_front_markers.popitem(last=False)
-
-    def _queue_for_reference_sync(self, msg: PointCloud2 | PointStamped, *, is_cloud: bool) -> None:
-        """Pair by exact scan timestamp, allowing either topic to arrive first."""
-        if msg.header.frame_id != 'world':
-            self.get_logger().warning(
-                f'Ignoring {"cloud" if is_cloud else "row-start reference"} '
-                f'in frame {msg.header.frame_id!r}; expected world.'
-            )
-            return
-        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
-        queue = self._pending_clouds if is_cloud else self._pending_references
-        queue[stamp] = msg
-        queue.move_to_end(stamp)
-
+        self._pending_rear_axle_markers[stamp] = msg
+        self._pending_rear_axle_markers.move_to_end(stamp)
         self._try_process_synchronized_stamp(stamp)
-
-        # Evict by arrival order, so earlier timestamps from bag replay can still match.
-        while len(queue) > self.row_start_ref_queue_size:
-            queue.popitem(last=False)
-            if is_cloud:
-                self.get_logger().warning('Dropping cloud without a matching world row-start reference.')
+        while len(self._pending_rear_axle_markers) > self.sync_queue_size:
+            self._pending_rear_axle_markers.popitem(last=False)
+            self.get_logger().warning('Dropping rear-axle marker without a matching world ROI cloud.')
 
     def _try_process_synchronized_stamp(self, stamp: tuple[int, int]) -> None:
-        if stamp not in self._pending_clouds or stamp not in self._pending_references:
+        if stamp not in self._pending_clouds or stamp not in self._pending_rear_axle_markers:
             return
         if self.enable_fov_boundary_row_filter and stamp not in self._pending_fov_markers:
             return
         cloud = self._pending_clouds.pop(stamp)
-        reference = self._pending_references.pop(stamp)
         fov_marker = self._pending_fov_markers.pop(stamp, None)
-        chassis_front_marker = self._pending_chassis_front_markers.pop(stamp, None)
-        fov_filter_enabled = bool(getattr(self, 'enable_fov_boundary_row_filter', False))
-        chassis_distance_enabled = bool(
-            getattr(self, 'enable_chassis_front_path_distance_publisher', False)
-        )
-        if fov_filter_enabled or chassis_distance_enabled:
-            self._process_cloud(cloud, reference, fov_marker, chassis_front_marker)
-        else:
-            self._process_cloud(cloud, reference)
+        rear_axle_marker = self._pending_rear_axle_markers.pop(stamp)
+        self._process_cloud(cloud, rear_axle_marker, fov_marker)
 
     def _process_cloud(
-        self, msg: PointCloud2, reference: PointStamped, fov_marker: Marker | None = None,
-        chassis_front_marker: Marker | None = None,
+        self, msg: PointCloud2, rear_axle_marker: Marker, fov_marker: Marker | None = None,
     ) -> None:
         self.frame_count += 1
         stamp_sec = msg.header.stamp.sec
@@ -1325,26 +1051,6 @@ class PathPipelineNode(Node):
 
         valid_xyz_count = int(xyz.shape[0])
         roi_xy_count = int(xy_roi.shape[0])
-
-        _, geometric_path_records = self._build_geometric_paths(xy_roi)
-        geometric_output_paths: list[dict] = []
-        geometric_start_lines: list[dict] = []
-        if self.enable_geometric_path_experiment:
-            geometric_output_paths = self.geometric_path_start_tracker.update(
-                geometric_path_records,
-                stamp_ns,
-                self._eor_line_reference,
-                self._eor_line_direction,
-            )
-            if self._eor_line_reference is not None and self._eor_line_direction is not None:
-                geometric_start_lines = self.geometric_start_line_tracker.update(
-                    self.geometric_path_start_tracker.confirmed_starts(),
-                    self._eor_line_reference,
-                    self._eor_line_direction,
-                )
-        geometric_paths_published = self._publish_geometric_paths(
-            msg, geometric_output_paths, geometric_start_lines,
-        )
 
         rows_detected = -1
         rows_discarded_fov = 0
@@ -1369,7 +1075,7 @@ class PathPipelineNode(Node):
         published_markers = -1
         published_row_markers = -1
         published_group_start_distance: float | None = None
-        chassis_front_path_distance: float | None = None
+        rear_axle_path_distance: float | None = None
         group_start_lines_count = -1
         output_paths: list[dict] = []
         group_start_lines: list[dict] = []
@@ -1443,7 +1149,7 @@ class PathPipelineNode(Node):
                     ]
 
             published_group_start_distance = self._publish_group_start_distance(
-                reference, group_start_lines, stamp_ns,
+                rear_axle_marker, group_start_lines, stamp_ns,
             )
 
             # The threshold can be crossed on a scan without a new detection.
@@ -1462,12 +1168,12 @@ class PathPipelineNode(Node):
                 published_markers = self._publish_debug_markers(msg, output_paths, group_start_lines)
 
         if (
-            bool(getattr(self, 'enable_chassis_front_path_distance_publisher', False))
-            and chassis_front_marker is not None
+            self.enable_rear_axle_path_distance_publisher
+            and rear_axle_marker is not None
             and output_paths
         ):
-            chassis_front_path_distance = self._publish_chassis_front_path_distance(
-                msg, chassis_front_marker, output_paths,
+            rear_axle_path_distance = self._publish_rear_axle_path_distance(
+                rear_axle_marker, output_paths,
             )
 
         self.get_logger().info(
@@ -1483,7 +1189,7 @@ class PathPipelineNode(Node):
             f'| groups_detected={groups_detected} '
             f'| group_start_lines={group_start_lines_count} '
             f'| group_start_distance={published_group_start_distance} '
-            f'| chassis_front_path_distance={chassis_front_path_distance} '
+            f'| rear_axle_path_distance={rear_axle_path_distance} '
             f'| detection_stopped={self._row_path_detection_stopped} '
             f'| published_paths={published_paths} '
             f'| published_markers={published_markers} '

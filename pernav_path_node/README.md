@@ -28,7 +28,7 @@ ros2 bag play -l ../data/SPE_2026-06-11_Linden/rosbag2/rosbag2_0.mcap
 ```mermaid
 flowchart LR
     A[/pcl_world_roi PointCloud2/] --> S[Match exact scan timestamp]
-    R[/pernav/row_start_ref_world PointStamped/] --> S
+    R[/pernav/rear_axle_marker_world Marker/] --> S
     S --> B[Parse XYZ]
     B --> C[Project to XY]
     C --> D[Row detection RANSAC]
@@ -50,7 +50,7 @@ flowchart LR
 
 ## Runtime flow (short)
 
-1. Match the cloud to its world-frame tractor reference by exact timestamp, then parse finite XYZ.
+1. Match the cloud to its world-frame rear-axle marker by exact timestamp, then parse finite XYZ.
 2. Project the already-filtered world-frame cloud to XY and partition it into
     strips between consecutive `/roi_markers_axes` lines.
 3. Run continuous-row RANSAC independently in each strip, then combine and
@@ -72,17 +72,12 @@ The tractor-relative rectangular ROI crop and chassis exclusion are configured i
 `rearaxle_to_world_node`, before the rear-axle-to-world transform. Both are disabled
 by default. This node retains finite-point validation but applies no tractor-relative crop.
 
-The rear-axle reference parameters `row_start_ref_x/y` now belong to
-`rearaxle_to_world_node`. This node subscribes to `row_start_ref_topic`
-(default `/pernav/row_start_ref_world`, `geometry_msgs/msg/PointStamped`).
-This synchronized point remains the tractor reference used for start-line distance
-and ROI lifecycle logic; it is not used to orient row endpoints. Row detection waits
-for the frozen EOR marker and always orients row starts toward that line.
-Both inputs must use the `world` frame. Either message can arrive first; each
-stream buffers up to `row_start_ref_queue_size` messages (default 100), evicting
-the oldest arrivals when full. There is no fallback to a fixed or latest reference.
-Record/replay the reference topic alongside `/pcl_world_roi`; older recordings
-without it need to be reprocessed from the rear-axle cloud and pose streams.
+This node subscribes to `/pernav/rear_axle_marker_world`
+(`visualization_msgs/msg/Marker`) as the synchronized tractor reference used
+for start-line distance and ROI lifecycle logic. The cloud and marker must use the
+`world` frame and have exactly matching timestamps. Either message can arrive first;
+each stream buffers up to `sync_queue_size` messages (default 100). Row detection
+waits for the frozen EOR marker and always orients row starts toward that line.
 
 ## Main interfaces
 
@@ -94,7 +89,7 @@ flowchart TB
     OUT2[Output topic\n/pernav/path_markers\nMarkerArray]
     OUT4[Output topic\n/pernav/detected_row_markers\nMarkerArray]
     OUT3[Output topic\n/pernav/group_start_line_distance\nFloat64 metres]
-    REF[Input topic\n/pernav/row_start_ref_world\nPointStamped]
+    REF[Input topic\n/pernav/rear_axle_marker_world\nMarker]
     REF --> NODE
     IN --> NODE --> OUT1
     NODE --> OUT2
@@ -104,13 +99,13 @@ flowchart TB
 
 `/pernav/group_start_line_distance` begins publishing after the first valid
 group start line is formed. It reports the unsigned shortest XY distance in
-metres from the synchronized `/pernav/row_start_ref_world` point to the nearest
+metres from the synchronized `/pernav/rear_axle_marker_world` point to the nearest
 retained finite line segment. A group's retained segment is updated when that
 group is detected again and survives scans with no group line. Retained lines
 clear when time moves backward or the node restarts.
 
 With `enable_group_start_distance_stop: true`, an above-to-below crossing of
-`group_start_distance_stop_threshold` (default `0.2` m) stops subsequent row and
+`group_start_distance_stop_threshold` (default `2.0` m) stops subsequent row and
 path searches. The node republishes the last nonempty confirmed path set and its
 group start lines while the reference-to-line distance continues updating. This
 stop is latched: moving above the threshold does not restart detection. A node
@@ -119,13 +114,9 @@ latch and cached geometry. The ROI node sends that event when an armed group-sta
 distance rises through its `5.0 m` deactivation threshold. This permits the next
 ROI cycle to detect and track a fresh set of paths.
 
-When a synchronized `/pernav/chassis_front_marker_world` and one or more published
-paths are available, `/pernav/chassis_front_to_path_entrance_distance` publishes the
-shortest XY distance in metres from the chassis front to a path entrance. The purple
-`/pernav/chassis_front_path_distance_marker` line identifies the entrance selected.
-For synchronized RViz inspection, add a `MarkerArray` display for
-`/pernav/chassis_front_path_distance_markers`: each message contains both the
-smaller red chassis-front sphere and its corresponding purple distance line.
+When a synchronized `/pernav/rear_axle_marker_world` and one or more published
+paths are available, `/pernav/rear_axle_to_path_entrance_distance` publishes the
+shortest XY distance in metres from the rear axle to a path entrance.
 
 `/pernav/detected_row_markers` publishes one world-frame `LINE_STRIP` for every
 row accepted for path construction in the current synchronized frame. Rows rejected
@@ -153,7 +144,7 @@ Most important groups:
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `enable_group_start_distance_stop` | `true` | Enable the latched falling-threshold detection stop |
-| `group_start_distance_stop_threshold` | `0.2` m | Stop after distance moves from above to at or below this value |
+| `group_start_distance_stop_threshold` | `2.0` m | Stop after distance moves from above to at or below this value |
 | `path_pipeline_reset_topic` | `/pernav/path_pipeline_reset` | Completed-ROI event that clears all per-cycle detection state |
 
 ## Persistent path starts

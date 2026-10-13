@@ -3,10 +3,8 @@ path_pipeline_node:
     # Input PointCloud2 topic name.
     input_topic: /pcl_world_roi
 
-    # World-frame PointStamped reference published by rearaxle_to_world_node.
-    # Detection waits for a reference with exactly the input cloud's timestamp.
-    row_start_ref_topic: /pernav/row_start_ref_world
-    row_start_ref_queue_size: 100
+    # Maximum buffered world clouds, FOV markers, and chassis-front markers.
+    sync_queue_size: 100
 
     # Parallel ROI axis lines used to partition /pcl_world_roi into detection strips.
     roi_axes_marker_topic: /roi_markers_axes
@@ -25,21 +23,11 @@ path_pipeline_node:
     enable_discarded_fov_row_marker_publisher: true
     discarded_fov_row_marker_topic: /pernav/discarded_fov_row_markers
 
-    # Unsigned XY distance from the transformed chassis-front marker to the
-    # nearest published path entrance, plus a purple RViz connection line.
-    enable_chassis_front_path_distance_publisher: true
-    chassis_front_marker_world_topic: /pernav/chassis_front_marker_world
-    chassis_front_path_distance_topic: /pernav/chassis_front_to_path_entrance_distance
-    chassis_front_path_distance_marker_topic: /pernav/chassis_front_path_distance_marker
-    chassis_front_path_distance_markers_topic: /pernav/chassis_front_path_distance_markers
-
-    # Experimental alternative to RANSAC: select the point nearest the EOR line
-    # in every ROI strip, midpoint adjacent starts, then draw reverse-driving paths.
-    # Existing RANSAC rows and paths remain enabled and unchanged.
-    enable_geometric_path_experiment: true
-    geometric_path_length: 3.0
-    geometric_path_output_topic: /pernav/geometric_paths
-    geometric_marker_output_topic: /pernav/geometric_path_markers
+    # Publish the unsigned XY distance from the synchronized world-frame
+    # rear-axle marker to the nearest published path entrance.
+    enable_rear_axle_path_distance_publisher: true
+    rear_axle_marker_world_topic: /pernav/rear_axle_marker_world
+    rear_axle_path_distance_topic: /pernav/rear_axle_to_path_entrance_distance
 
     # Tractor-relative ROI and chassis filters belong to rearaxle_to_world_node.
 
@@ -126,9 +114,8 @@ path_pipeline_node:
     # Enable/disable publishing path start poses as geometry_msgs/PoseArray.
     enable_path_publisher: true
 
-    # Publish the shortest XY distance [m] from row_start_ref_world to the
-    # nearest retained finite group start line. Publishing begins after the
-    # first valid group line is created.
+    # Publish the shortest XY distance [m] from the synchronized world-frame
+    # rear-axle marker to the nearest retained finite group start line.
     enable_group_start_distance_publisher: true
     group_start_distance_topic: /pernav/group_start_line_distance
 
@@ -136,7 +123,7 @@ path_pipeline_node:
     # to at or below it. The last nonempty confirmed paths and start lines keep
     # publishing. The stop remains latched until restart or timestamp rewind.
     enable_group_start_distance_stop: true
-    group_start_distance_stop_threshold: 0.5
+    group_start_distance_stop_threshold: 2.0
 
     # Reset event from roi_filter_node when the completed ROI is deactivated.
     # Clears tracks, retained lines, cached outputs, and the detection-stop latch.

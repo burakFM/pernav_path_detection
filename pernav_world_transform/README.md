@@ -9,7 +9,7 @@ flowchart LR
     A[/pcl_prep<br/>PointCloud2/] --> T[rearaxle_to_world_node]
     B[/pose_rearAxle2worldGNSS<br/>TransformStamped/] --> T
     T --> C[/pcl_world<br/>PointCloud2/]
-    T --> R[/pernav/row_start_ref_world<br/>PointStamped/]
+    T --> R[/pernav/rear_axle_marker_world<br/>Marker/]
     C --> F[roi_filter_node]
     D[/end_of_row<br/>PoseArray/] --> F
     E[/distance_to_eor<br/>Float64/] --> F
@@ -22,7 +22,7 @@ flowchart LR
 The output of this package is the input of `pernav_path_node`:
 
 ```text
-/pcl_world_roi + /pernav/row_start_ref_world -> path_pipeline_node -> /pernav/paths
+/pcl_world_roi + /pernav/rear_axle_marker_world -> path_pipeline_node -> /pernav/paths
 ```
 
 ## Build
@@ -52,21 +52,21 @@ Create and apply the frozen ROI:
 ros2 run pernav_world_transform roi_filter_node
 ```
 
-### Visualize the LiDAR FOV on `/pcl_prep`
+### Visualize the LiDAR FOV in the world frame
 
-Run this separately to publish two orange 110-degree (±55-degree) border rays in
-the exact frame and timestamp of every `/pcl_prep` cloud, plus a world-frame
-copy transformed with the closest `/pose_rearAxle2worldGNSS` pose:
+Run this separately to publish two orange 120-degree (±60-degree) world-frame
+border rays for every `/pcl_prep` cloud. The rays begin at the LiDAR origin and
+use the LiDAR orientation from `/pose_lidar2rearAxle`, then transform into `world`
+with the closest `/pose_rearAxle2worldGNSS` pose:
 
 ```bash
 ros2 run pernav_world_transform fov_marker_node
 ```
 
-In RViz, add `Marker` displays for `/pernav/lidar_fov_marker` (raw cloud frame)
-and `/pernav/lidar_fov_marker_world` (`world` frame). The border rays assume the
-sensor faces `+X` and `+Y` is left. They only visualize the border; they do not
-modify `/pcl_prep`. The default range is 20 m. Override it, for
-example, with:
+In RViz, add a `Marker` display for `/pernav/lidar_fov_marker_world` with `world`
+as the fixed frame. The border rays assume the sensor faces `+X` and `+Y` is left.
+They only visualize the border; they do not modify `/pcl_prep`. The default range
+is 20 m. Override it, for example, with:
 
 ```bash
 ros2 run pernav_world_transform fov_marker_node --ros-args -p range_m:=30.0
@@ -92,22 +92,15 @@ This node matches each `/pcl_prep` scan to the closest buffered rear-axle pose. 
 | Input | `/pcl_prep` | `sensor_msgs/msg/PointCloud2` |
 | Input | `/pose_rearAxle2worldGNSS` | `geometry_msgs/msg/TransformStamped` |
 | Output | `/pcl_world` | `sensor_msgs/msg/PointCloud2` |
-| Output | `/pernav/row_start_ref_world` | `geometry_msgs/msg/PointStamped` |
+| Output | `/pernav/rear_axle_marker_world` | `visualization_msgs/msg/Marker` |
 
 The output has `header.frame_id: world` and contains XYZ fields. Other fields from the input cloud are not copied.
 
-For each published cloud, the node also transforms `(row_start_ref_x, row_start_ref_y, 0)`
-using the same matched pose. It publishes a `PointStamped` in `world` with the
-**LiDAR scan timestamp**, allowing the path node to match it exactly after ROI filtering.
-The reference is published even if the optional spatial filters remove all points.
-Skipped scans (missing/distant pose or no valid input XYZ) publish neither message.
-
-To change the rear-axle reference, restart this node with parameter overrides:
-
-```bash
-ros2 run pernav_world_transform rearaxle_to_world_node --ros-args \
-  -p row_start_ref_x:=3.0 -p row_start_ref_y:=0.0
-```
+For each transformed cloud, the node publishes the rear-axle centre as a world-frame
+`Marker` with the same LiDAR scan timestamp. The path node uses this marker as its
+synchronized tractor reference for path-entrance and group-line distance calculations.
+The marker is published whenever `enable_rear_axle_marker` is enabled, independently
+of chassis exclusion.
 
 ### Parameters
 
@@ -118,20 +111,18 @@ ros2 run pernav_world_transform rearaxle_to_world_node --ros-args \
 | `output_pointcloud_topic` | `/pcl_world` | Transformed output cloud |
 | `max_pose_time_difference` | `0.1` | Maximum cloud-to-pose timestamp difference in seconds |
 | `pose_buffer_size` | `100` | Maximum number of poses retained for matching |
-| `row_start_ref_x`, `row_start_ref_y` | `3.0`, `0.0` | Row-start reference in rear-axle coordinates, in metres (Z = 0) |
-| `row_start_ref_topic` | `/pernav/row_start_ref_world` | Output topic for the transformed reference |
 | `enable_rectangular_roi_filter` | `false` | Enable the rear-axle-frame XY crop before transformation |
 | `roi_x_min`, `roi_x_max` | `0.0`, `20.0` | Inclusive ROI X bounds in metres |
 | `roi_y_min`, `roi_y_max` | `-10.0`, `10.0` | Inclusive ROI Y bounds in metres |
 | `enable_chassis_exclusion` | `false` | Remove the tractor chassis XY box before transformation |
 | `chassis_exclusion_x_min`, `chassis_exclusion_x_max` | `0.0`, `4.0` | Chassis X bounds in metres; boundary points are removed |
 | `chassis_exclusion_y_min`, `chassis_exclusion_y_max` | `-1.0`, `1.0` | Chassis Y bounds in metres; boundary points are removed |
-| `enable_chassis_front_marker` | `true` | Publish the chassis exclusion box's front-centre marker while exclusion is enabled |
-| `chassis_front_marker_topic` | `/pernav/chassis_front_marker` | Front marker in the `/pcl_prep` frame |
-| `chassis_front_marker_world_topic` | `/pernav/chassis_front_marker_world` | Same marker transformed into `world` |
+| `enable_rear_axle_marker` | `true` | Publish the rear-axle centre marker in `world` |
+| `rear_axle_marker_world_topic` | `/pernav/rear_axle_marker_world` | Rear-axle marker in `world` |
 
-When chassis exclusion is enabled, the marker is a red sphere at the front
-centre of the excluded rectangle: `(chassis_exclusion_x_max, midpoint(y_min, y_max), 0)`.
+The marker is a blue 0.1 m sphere at the rear-axle origin, using the translation of
+the matched `/pose_rearAxle2worldGNSS` pose. It remains available when chassis
+exclusion is disabled.
 
 These filter parameters moved from `pernav_path_node` to this node. Their bounds are
 relative to the rear axle, and Z is preserved. With both filters disabled, all finite
@@ -240,7 +231,7 @@ Check that the nodes and topics are active:
 ```bash
 ros2 node list
 ros2 topic hz /pcl_world
-ros2 topic echo /pernav/row_start_ref_world --once
+ros2 topic echo /pernav/rear_axle_marker_world --once
 ros2 topic hz /pcl_world_roi
 ros2 topic echo /pernav/path_pipeline_reset
 ros2 topic echo /pcl_world --field header --once

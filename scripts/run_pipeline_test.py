@@ -55,8 +55,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{{
                 'input_pointcloud_topic': '/pcl_prep',
-                'marker_topic': '/pernav/lidar_fov_marker',
-                'fov_degrees': 110.0,
+                'fov_degrees': 120.0,
                 'range_m': 20.0,
             }}],
         ),
@@ -321,6 +320,7 @@ def prepare_run(
         "pernav_path_node/pernav_path_node/path_start_tracker.py",
         "pernav_path_node/pernav_path_node/plot_video.py",
         "pernav_world_transform/pernav_world_transform/rearaxle_to_world_node.py",
+        "pernav_world_transform/pernav_world_transform/fov_marker_node.py",
         "pernav_world_transform/pernav_world_transform/roi_filter_node.py",
     ):
         shutil.copy2(REPOSITORY / relative_path, snapshot)
