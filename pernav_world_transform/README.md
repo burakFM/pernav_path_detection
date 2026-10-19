@@ -15,6 +15,8 @@ flowchart LR
     E[/distance_to_eor<br/>Float64/] --> F
     I[/pernav/group_start_line_distance<br/>Float64/] --> F
     F --> G[/pcl_world_roi<br/>PointCloud2/]
+    G --> K[roi_cloud_accumulator_node]
+    K --> L[/pernav/pcl_world_roi_accumulated<br/>PointCloud2/]
     F --> H[/roi_markers<br/>Marker/]
     F --> J[/pernav/path_pipeline_reset<br/>Empty/]
 ```
@@ -22,7 +24,7 @@ flowchart LR
 The output of this package is the input of `pernav_path_node`:
 
 ```text
-/pcl_world_roi + /pernav/rear_axle_marker_world -> path_pipeline_node -> /pernav/paths
+/pernav/pcl_world_roi_accumulated + /pernav/rear_axle_marker_world -> path_pipeline_node -> /pernav/paths
 ```
 
 ## Build
@@ -51,6 +53,21 @@ Create and apply the frozen ROI:
 ```bash
 ros2 run pernav_world_transform roi_filter_node
 ```
+
+Accumulate the active ROI clouds for row detection:
+
+```bash
+ros2 run pernav_world_transform roi_cloud_accumulator_node
+```
+
+The accumulator accepts every `/pcl_world_roi` cloud, keeps the latest 50 clouds
+(about a 5-second rolling window with the 10 Hz LiDAR), merges them, and applies
+0.02 m XY voxel downsampling. It publishes the result on
+`/pernav/pcl_world_roi_accumulated` immediately after each input cloud, so
+`path_pipeline_node` creates fresh rows and paths at the incoming LiDAR rate.
+It also applies the frozen `/roi_markers` rectangle after merging, so the
+accumulated cloud cannot contain points outside the active ROI. `/pcl_world_roi`
+remains the single-scan ROI cloud.
 
 ### Visualize the LiDAR FOV in the world frame
 
@@ -211,6 +228,7 @@ Invalid end-of-row XY entries are discarded; the ROI requires at least two remai
 | `deactivation_distance` | `5.0` | Rising threshold that ends an armed ROI cycle, in metres |
 | `eor_deactivation_distance` | `10.0` | Rearm level and subsequent falling threshold for the independent `/distance_to_eor` deactivation fallback, in metres |
 | `path_pipeline_reset_topic` | `/pernav/path_pipeline_reset` | Reset event published when a cycle ends |
+| `roi_marker_republish_period_sec` | `0.5` | Republish frozen ROI and axis markers while the ROI is active |
 | `debug` | `true` | Enable periodic point-count logging |
 | `plot_output_path` | `roi_world_snapshot.png` | First-cycle snapshot; later cycles add `_cycle_NNN` |
 

@@ -140,14 +140,34 @@ def detect_rows_from_xy(
         if line_k is None or inlier_mask_k is None:
             break
 
-        a_k, b_k, c_k = line_k
+        a_k, b_k, _ = line_k
         seg_points = working_points[inlier_mask_k]
         if seg_points.shape[0] < min_segment_inliers:
             break
 
-        line_dir = np.array([-b_k, a_k], dtype=float)
-        line_dir /= np.linalg.norm(line_dir)
-        line_org = -c_k * np.array([a_k, b_k], dtype=float) / (a_k**2 + b_k**2)
+        # RANSAC robustly chooses the continuous inlier segment.  Fit that
+        # selected segment with total least squares (PCA) so the published
+        # row uses every inlier rather than the two points of the RANSAC draw.
+        line_org = np.mean(seg_points, axis=0)
+        _, _, right_singular_vectors = np.linalg.svd(
+            seg_points - line_org,
+            full_matrices=False,
+        )
+        line_dir = right_singular_vectors[0]
+        line_dir_norm = float(np.linalg.norm(line_dir))
+        if line_dir_norm <= 1e-9:
+            break
+        line_dir /= line_dir_norm
+
+        # Keep a stable orientation relative to the winning RANSAC proposal.
+        ransac_dir = np.array([-b_k, a_k], dtype=float)
+        ransac_dir /= np.linalg.norm(ransac_dir)
+        if float(line_dir @ ransac_dir) < 0.0:
+            line_dir = -line_dir
+
+        line_normal = np.array([-line_dir[1], line_dir[0]], dtype=float)
+        a_k, b_k = float(line_normal[0]), float(line_normal[1])
+        c_k = float(-(line_normal @ line_org))
 
         projections = (seg_points - line_org) @ line_dir
         t_min, t_max = np.percentile(projections, [2, 98])
@@ -173,8 +193,7 @@ def detect_rows_from_xy(
             }
         )
 
-        line_norm = math.sqrt(a_k * a_k + b_k * b_k)
-        distances = np.abs(a_k * working_points[:, 0] + b_k * working_points[:, 1] + c_k) / line_norm
+        distances = np.abs((working_points - line_org) @ line_normal)
         keep_mask = distances >= remove_radius
         working_points = working_points[keep_mask]
 
@@ -229,6 +248,10 @@ def build_paths_from_rows(
         path_records.append(
             {
                 'path_id': len(path_records) + 1,
+                # A path occupies the corridor between this strip and the
+                # next one.  The pipeline uses this stable key to retain a
+                # path when another strip temporarily has no RANSAC result.
+                'roi_strip_id': int(strip_id),
                 'row_a_id': int(row_i['row_id']),
                 'row_b_id': int(row_j['row_id']),
                 'row_a_start_x': float(start_i[0]),

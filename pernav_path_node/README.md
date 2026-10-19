@@ -27,7 +27,9 @@ ros2 bag play -l ../data/SPE_2026-06-11_Linden/rosbag2/rosbag2_0.mcap
 
 ```mermaid
 flowchart LR
-    A[/pcl_world_roi PointCloud2/] --> S[Match exact scan timestamp]
+    A[/pcl_world_roi PointCloud2/] --> ACC[5 s rolling accumulator]
+    ACC --> I[/pernav/pcl_world_roi_accumulated PointCloud2/]
+    I --> S[Match exact scan timestamp]
     R[/pernav/rear_axle_marker_world Marker/] --> S
     S --> B[Parse XYZ]
     B --> C[Project to XY]
@@ -50,7 +52,9 @@ flowchart LR
 
 ## Runtime flow (short)
 
-1. Match the cloud to its world-frame rear-axle marker by exact timestamp, then parse finite XYZ.
+1. Receive the voxel-downsampled rolling ROI cloud from
+   `/pernav/pcl_world_roi_accumulated`, match it to its world-frame rear-axle marker
+   by exact timestamp, then parse finite XYZ.
 2. Project the already-filtered world-frame cloud to XY and partition it into
     strips between consecutive `/roi_markers_axes` lines.
 3. Run continuous-row RANSAC independently in each strip, then combine and
@@ -72,6 +76,15 @@ The tractor-relative rectangular ROI crop and chassis exclusion are configured i
 `rearaxle_to_world_node`, before the rear-axle-to-world transform. Both are disabled
 by default. This node retains finite-point validation but applies no tractor-relative crop.
 
+`roi_cloud_accumulator_node` samples `/pcl_world_roi` every 0.2 seconds, retains
+the latest 25 samples, merges them, and applies 0.02 m XY voxel downsampling before
+publishing `/pernav/pcl_world_roi_accumulated`. The buffer is cleared by
+`/pernav/path_pipeline_reset`, so points never carry into the next ROI cycle.
+Fresh row and path detection runs when that accumulated topic updates (5 Hz). The
+latest detected and FOV-discarded row markers, confirmed path entrances, path markers,
+and rear-axle distance values are then republished for every rear-axle marker (about
+10 Hz) without adding duplicate observations to the path-start average.
+
 This node subscribes to `/pernav/rear_axle_marker_world`
 (`visualization_msgs/msg/Marker`) as the synchronized tractor reference used
 for start-line distance and ROI lifecycle logic. The cloud and marker must use the
@@ -83,7 +96,7 @@ waits for the frozen EOR marker and always orients row starts toward that line.
 
 ```mermaid
 flowchart TB
-    IN[Input topic\n/pcl_world_roi\nPointCloud2]
+    IN[Input topic\n/pernav/pcl_world_roi_accumulated\nPointCloud2]
     NODE[path_pipeline_node]
     OUT1[Output topic\n/pernav/paths\nPoseArray start poses]
     OUT2[Output topic\n/pernav/path_markers\nMarkerArray]
@@ -122,9 +135,11 @@ shortest XY distance in metres from the rear axle to a path entrance.
 row accepted for path construction in the current synchronized frame. Rows rejected
 because their EOR-oriented start is closer than `fov_boundary_min_distance_m` to a
 world FOV boundary ray are published in red on `/pernav/discarded_fov_row_markers`.
-Row IDs are local to that frame;
-rows are not tracked or retained across scans. Marker lifetime uses
-`marker_lifetime_sec`, and the topic is cleared on a path-pipeline cycle reset.
+Row IDs are local to each frame. Rows and paths are retained independently for
+each ROI strip: a fresh result from one strip updates only that strip, while a
+temporary RANSAC failure in another strip keeps its last valid rows and entrance
+path. These per-strip caches clear on a path-pipeline cycle reset. Marker
+lifetime uses `marker_lifetime_sec` (default: 1.0 s).
 
 ## Where to tune parameters
 
@@ -144,12 +159,14 @@ Most important groups:
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `enable_group_start_distance_stop` | `true` | Enable the latched falling-threshold detection stop |
-| `group_start_distance_stop_threshold` | `2.0` m | Stop after distance moves from above to at or below this value |
+| `group_start_distance_stop_threshold` | `0.2` m | Stop after chassis-front distance to the group-start line moves from above to at or below this value |
 | `path_pipeline_reset_topic` | `/pernav/path_pipeline_reset` | Completed-ROI event that clears all per-cycle detection state |
 
 ## Persistent path starts
 
-`enable_path_start_tracking: true` enables tracking after parallel correction.
+`enable_path_start_tracking` is disabled by default because the rolling accumulated
+cloud already supplies the temporal point support. Set it to `true` only to enable
+additional tracking after parallel correction.
 Per-scan `path_id` values are not used to associate detections. Matching compares
 world-frame start positions against stored averages and gates directed heading
 differences (a 180-degree reversal is not the same heading). A global one-to-one
@@ -180,7 +197,7 @@ before replacing the active line.
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
-| `enable_path_start_tracking` | `true` | Enable association and averaging; false publishes per-scan paths |
+| `enable_path_start_tracking` | `false` | Enable association and averaging; false publishes each accumulated-cloud detection |
 | `tracking_max_distance` | `1.0` m | Maximum start-to-average distance for a match |
 | `tracking_max_heading_deg` | `20.0` degrees | Maximum directed heading difference |
 | `tracking_min_observations` | `3` | Observations needed before a new track is published; 1 publishes immediately |

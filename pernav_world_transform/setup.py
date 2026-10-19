@@ -21,6 +21,7 @@ setup(
         'console_scripts': [
             'rearaxle_to_world_node = pernav_world_transform.rearaxle_to_world_node:main',
             'roi_filter_node = pernav_world_transform.roi_filter_node:main',
+            'roi_cloud_accumulator_node = pernav_world_transform.roi_cloud_accumulator_node:main',
             'fov_marker_node = pernav_world_transform.fov_marker_node:main',
         ],
     },

@@ -49,6 +49,7 @@ class RoiFilterNode(Node):
                 ('deactivation_distance', 5.0),
                 ('eor_deactivation_distance', 10.0),
                 ('path_pipeline_reset_topic', '/pernav/path_pipeline_reset'),
+                ('roi_marker_republish_period_sec', 0.5),
                 ('debug', True),
                 ('plot_output_path', 'roi_world_snapshot.png'),
             ],
@@ -78,6 +79,9 @@ class RoiFilterNode(Node):
         self.path_pipeline_reset_topic = str(
             self.get_parameter('path_pipeline_reset_topic').value
         )
+        self.roi_marker_republish_period_sec = float(
+            self.get_parameter('roi_marker_republish_period_sec').value
+        )
         if (
             not np.isfinite(self.group_start_near_threshold)
             or self.group_start_near_threshold < 0.0
@@ -96,6 +100,11 @@ class RoiFilterNode(Node):
                 'End-of-row deactivation distance must be finite and greater than '
                 'the ROI activation distance.'
             )
+        if (
+            not np.isfinite(self.roi_marker_republish_period_sec)
+            or self.roi_marker_republish_period_sec <= 0.0
+        ):
+            raise ValueError('roi_marker_republish_period_sec must be finite and positive.')
         self.debug = bool(self.get_parameter('debug').value)
         self.plot_output_path = str(self.get_parameter('plot_output_path').value)
 
@@ -146,6 +155,7 @@ class RoiFilterNode(Node):
             10,
         )
         self.create_subscription(PointCloud2, self.input_pointcloud_topic, self.pointcloud_callback, 10)
+        self.create_timer(self.roi_marker_republish_period_sec, self._republish_active_roi_markers)
 
         self.get_logger().info('World-frame ROI filter started')
         self.get_logger().info(f'Input cloud: {self.input_pointcloud_topic}')
@@ -163,6 +173,13 @@ class RoiFilterNode(Node):
             f'{self.eor_deactivation_distance:.3f} m and deactivate on its next falling edge'
         )
         self.get_logger().info(f'Path-cycle reset topic: {self.path_pipeline_reset_topic}')
+
+    def _republish_active_roi_markers(self) -> None:
+        """Keep frozen ROI geometry available to nodes that join during a cycle."""
+        if not self.roi_active:
+            return
+        self.publish_roi_markers()
+        self.publish_roi_axes_marker()
 
     @staticmethod
     def _pointcloud2_xyz(msg: PointCloud2) -> np.ndarray:

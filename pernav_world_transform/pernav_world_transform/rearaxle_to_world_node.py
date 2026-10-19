@@ -45,6 +45,10 @@ class RearAxleToWorldNode(Node):
                 ('chassis_exclusion_y_max', 1.0),
                 ('enable_rear_axle_marker', True),
                 ('rear_axle_marker_world_topic', '/pernav/rear_axle_marker_world'),
+                ('enable_chassis_front_marker', True),
+                ('chassis_front_offset_x_m', 4.0),
+                ('chassis_front_offset_y_m', 0.0),
+                ('chassis_front_marker_world_topic', '/pernav/chassis_front_marker_world'),
             ],
         )
 
@@ -69,6 +73,12 @@ class RearAxleToWorldNode(Node):
         self.rear_axle_marker_world_topic = str(
             self.get_parameter('rear_axle_marker_world_topic').value
         )
+        self.enable_chassis_front_marker = bool(self.get_parameter('enable_chassis_front_marker').value)
+        self.chassis_front_offset_x_m = float(self.get_parameter('chassis_front_offset_x_m').value)
+        self.chassis_front_offset_y_m = float(self.get_parameter('chassis_front_offset_y_m').value)
+        self.chassis_front_marker_world_topic = str(
+            self.get_parameter('chassis_front_marker_world_topic').value
+        )
 
         self._pose_buffer: list[PoseSample] = []
         self._last_missing_pose_warn_sec = -1.0
@@ -79,6 +89,9 @@ class RearAxleToWorldNode(Node):
         self.cloud_publisher = self.create_publisher(PointCloud2, self.output_pointcloud_topic, 10)
         self.rear_axle_marker_world_publisher = self.create_publisher(
             Marker, self.rear_axle_marker_world_topic, 10,
+        )
+        self.chassis_front_marker_world_publisher = self.create_publisher(
+            Marker, self.chassis_front_marker_world_topic, 10,
         )
 
         self.pose_subscription = self.create_subscription(
@@ -258,6 +271,26 @@ class RearAxleToWorldNode(Node):
         marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 0.0, 1.0, 1.0
         self.rear_axle_marker_world_publisher.publish(marker)
 
+    def _publish_chassis_front_marker(self, source_msg: PointCloud2, pose_sample: PoseSample) -> None:
+        if not self.enable_chassis_front_marker:
+            return
+        offset_rear = np.array([
+            self.chassis_front_offset_x_m, self.chassis_front_offset_y_m, 0.0,
+        ])
+        position = offset_rear @ pose_sample.rotation.T + pose_sample.translation
+        marker = Marker()
+        marker.header.stamp = source_msg.header.stamp
+        marker.header.frame_id = 'world'
+        marker.ns = 'chassis_front_world'
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = map(float, position)
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = marker.scale.z = 0.10
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 1.0
+        self.chassis_front_marker_world_publisher.publish(marker)
+
     def _cloud_callback(self, msg: PointCloud2) -> None:
         lidar_stamp_sec = self._stamp_to_sec(msg.header.stamp)
         pose_sample, delta_sec = self._find_closest_pose(lidar_stamp_sec)
@@ -283,6 +316,7 @@ class RearAxleToWorldNode(Node):
         points_world = points_rear @ pose_sample.rotation.T + pose_sample.translation
 
         self._publish_rear_axle_marker(msg, pose_sample)
+        self._publish_chassis_front_marker(msg, pose_sample)
 
         self.cloud_publisher.publish(self._build_xyz_cloud(points_world, msg))
 

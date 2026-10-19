@@ -47,6 +47,8 @@ def generate_launch_description():
                 'chassis_exclusion_x_max': 4.0,
                 'chassis_exclusion_y_min': -1.0,
                 'chassis_exclusion_y_max': 1.0,
+                'chassis_front_offset_x_m': 4.0,
+                'chassis_front_offset_y_m': 0.0,
             }}],
         ),
         Node(
@@ -71,7 +73,19 @@ def generate_launch_description():
                 'deactivation_distance': 5.0,
                 'eor_deactivation_distance': 10.0,
                 'path_pipeline_reset_topic': '/pernav/path_pipeline_reset',
+                'roi_marker_republish_period_sec': 0.5,
                 'plot_output_path': str(run / 'roi_snapshot.png'),
+            }}],
+        ),
+        Node(
+            package='pernav_world_transform',
+            executable='roi_cloud_accumulator_node',
+            output='screen',
+            parameters=[{{
+                'sampling_period_sec': 0.0,
+                'accumulated_cloud_count': 30,
+                'voxel_size_m': 0.02,
+                'path_pipeline_reset_topic': '/pernav/path_pipeline_reset',
             }}],
         ),
         Node(
@@ -290,6 +304,11 @@ def create_run_folder(args: argparse.Namespace) -> Path:
     return run_folder
 
 
+def recorded_bag_name(run_folder: Path) -> str:
+    """Return a recording name that identifies the test which produced it."""
+    return f"{run_folder.name}_all_topics"
+
+
 def prepare_run(
     run_folder: Path,
     args: argparse.Namespace,
@@ -322,6 +341,7 @@ def prepare_run(
         "pernav_world_transform/pernav_world_transform/rearaxle_to_world_node.py",
         "pernav_world_transform/pernav_world_transform/fov_marker_node.py",
         "pernav_world_transform/pernav_world_transform/roi_filter_node.py",
+        "pernav_world_transform/pernav_world_transform/roi_cloud_accumulator_node.py",
     ):
         shutil.copy2(REPOSITORY / relative_path, snapshot)
     return commit
@@ -420,15 +440,16 @@ def write_summary(
     recorded_bag: dict[str, Any] = {"enabled": not args.no_record}
     bag_valid = args.no_record
     if not args.no_record:
+        bag_name = recorded_bag_name(run_folder)
         bag_info = run_logged(
-            ["ros2", "bag", "info", "recorded_all_topics"],
+            ["ros2", "bag", "info", bag_name],
             run_folder / "bag_info.txt",
             cwd=run_folder,
             environment=sourced_environment(args.domain_id, run_folder / "ros_logs"),
         )
         bag_text = (run_folder / "bag_info.txt").read_text(encoding="utf-8", errors="replace")
         recorded_bag.update(parse_bag_info(bag_text))
-        recorded_bag["path"] = "recorded_all_topics"
+        recorded_bag["path"] = bag_name
         recorded_bag["integrity_check_passed"] = bag_info.returncode == 0
         bag_valid = bag_info.returncode == 0
 
@@ -534,11 +555,12 @@ def main() -> int:
             raise RuntimeError(f"pipeline launch exited early with code {launch_process.returncode}")
 
         if not args.no_record:
+            bag_name = recorded_bag_name(run_folder)
             recorder_process, recorder_log = start_logged(
                 [
                     "ros2", "bag", "record", "-a", "--include-hidden-topics",
                     "--storage", "mcap", "--storage-preset-profile", "zstd_fast",
-                    "-o", "recorded_all_topics",
+                    "-o", bag_name,
                 ],
                 run_folder / "recorder.log",
                 cwd=run_folder,

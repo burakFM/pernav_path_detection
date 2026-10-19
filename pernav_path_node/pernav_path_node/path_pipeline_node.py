@@ -55,8 +55,12 @@ class PathPipelineNode(Node):
                 ('enable_rear_axle_path_distance_publisher', True),
                 ('rear_axle_marker_world_topic', '/pernav/rear_axle_marker_world'),
                 ('rear_axle_path_distance_topic', '/pernav/rear_axle_to_path_entrance_distance'),
+                ('chassis_front_marker_world_topic', '/pernav/chassis_front_marker_world'),
+                ('enable_chassis_front_path_entrance_line_distance_publisher', True),
+                ('chassis_front_path_entrance_line_distance_topic',
+                 '/pernav/chassis_front_to_path_entrance_line_distance'),
                 ('enable_row_detection', True),
-                ('row_distance_threshold', 0.2),
+                ('row_distance_threshold', 0.1),
                 ('row_max_gap', 0.6),
                 ('row_max_iterations', 400),
                 ('row_min_segment_inliers', 40),
@@ -65,7 +69,7 @@ class PathPipelineNode(Node):
                 ('row_min_points_left', 30),
                 ('enable_path_detection', True),
                 ('min_path_length', 1.0),
-                ('enable_path_start_tracking', True),
+                ('enable_path_start_tracking', False),
                 ('tracking_max_distance', 1.0),
                 ('tracking_max_heading_deg', 20.0),
                 ('tracking_min_observations', 3),
@@ -83,7 +87,7 @@ class PathPipelineNode(Node):
                 ('enable_row_marker_publisher', True),
                 ('row_marker_output_topic', '/pernav/detected_row_markers'),
                 ('marker_line_width', 0.08),
-                ('marker_lifetime_sec', 0.2),
+                ('marker_lifetime_sec', 1.0),
                 ('enable_notebook_plot', False),
                 ('enable_plot_video', False),
                 ('plot_video_output_path', 'output/pernav_path_plot_{timestamp}.mp4'),
@@ -104,7 +108,7 @@ class PathPipelineNode(Node):
                 ('enable_group_start_distance_publisher', True),
                 ('group_start_distance_topic', '/pernav/group_start_line_distance'),
                 ('enable_group_start_distance_stop', True),
-                ('group_start_distance_stop_threshold', 2.0),
+                ('group_start_distance_stop_threshold', 0.2),
                 ('path_pipeline_reset_topic', '/pernav/path_pipeline_reset'),
             ],
         )
@@ -118,6 +122,7 @@ class PathPipelineNode(Node):
         self._pending_clouds: OrderedDict[tuple[int, int], PointCloud2] = OrderedDict()
         self._pending_fov_markers: OrderedDict[tuple[int, int], Marker] = OrderedDict()
         self._pending_rear_axle_markers: OrderedDict[tuple[int, int], Marker] = OrderedDict()
+        self._pending_chassis_front_markers: OrderedDict[tuple[int, int], Marker] = OrderedDict()
         self._roi_strip_normal: np.ndarray | None = None
         self._roi_strip_boundaries: np.ndarray | None = None
         self.enable_fov_boundary_row_filter = bool(
@@ -148,6 +153,19 @@ class PathPipelineNode(Node):
         )
         self.rear_axle_path_distance_topic = str(
             self.get_parameter('rear_axle_path_distance_topic').value
+        )
+        self.chassis_front_marker_world_topic = str(
+            self.get_parameter('chassis_front_marker_world_topic').value
+        )
+        self.enable_chassis_front_path_entrance_line_distance_publisher = bool(
+            self.get_parameter(
+                'enable_chassis_front_path_entrance_line_distance_publisher'
+            ).value
+        )
+        self.chassis_front_path_entrance_line_distance_topic = str(
+            self.get_parameter(
+                'chassis_front_path_entrance_line_distance_topic'
+            ).value
         )
         self.enable_row_detection = bool(self.get_parameter('enable_row_detection').value)
         self.row_distance_threshold = float(self.get_parameter('row_distance_threshold').value)
@@ -231,6 +249,9 @@ class PathPipelineNode(Node):
         self._row_path_detection_stopped = False
         self._last_confirmed_output_paths: list[dict] = []
         self._last_confirmed_group_start_lines: list[dict] = []
+        self._rows_by_roi_strip: dict[int, dict] = {}
+        self._paths_by_roi_strip: dict[int, dict] = {}
+        self._last_discarded_fov_row_records: list[dict] = []
 
         self._plt: Any = None
         self._fig: Any = None
@@ -250,6 +271,9 @@ class PathPipelineNode(Node):
         )
         self.rear_axle_path_distance_publisher = self.create_publisher(
             Float64, self.rear_axle_path_distance_topic, 10,
+        )
+        self.chassis_front_path_entrance_line_distance_publisher = self.create_publisher(
+            Float64, self.chassis_front_path_entrance_line_distance_topic, 10,
         )
 
         if self.enable_notebook_plot or self.enable_plot_video:
@@ -290,6 +314,12 @@ class PathPipelineNode(Node):
             Marker,
             self.rear_axle_marker_world_topic,
             self.rear_axle_marker_callback,
+            10,
+        )
+        self.chassis_front_marker_subscription = self.create_subscription(
+            Marker,
+            self.chassis_front_marker_world_topic,
+            self.chassis_front_marker_callback,
             10,
         )
         self.get_logger().info(
@@ -385,12 +415,20 @@ class PathPipelineNode(Node):
         """Retain group lines and publish distance to the nearest retained segment."""
         self._prepare_group_start_distance_stamp(stamp_ns)
 
+        valid_current_lines: dict[int, dict] = {}
         for line in current_lines:
             values = np.array(
                 [line['start_x'], line['start_y'], line['end_x'], line['end_y']], dtype=float,
             )
             if np.isfinite(values).all():
-                self._retained_group_start_lines[int(line['group_id'])] = dict(line)
+                valid_current_lines[int(line['group_id'])] = dict(line)
+
+        # Replace the retained set only when a valid current result exists.
+        # Updating individual group IDs left obsolete lines from earlier
+        # detections in the set, allowing distance diagnostics to refer to a
+        # line no longer published in the current visualization.
+        if valid_current_lines:
+            self._retained_group_start_lines = valid_current_lines
 
         if not self._retained_group_start_lines:
             return None
@@ -407,7 +445,6 @@ class PathPipelineNode(Node):
             msg = Float64()
             msg.data = distance
             self.group_start_distance_publisher.publish(msg)
-        self._update_group_start_distance_stop(distance)
         return distance
 
     def _prepare_group_start_distance_stamp(self, stamp_ns: int) -> None:
@@ -426,6 +463,9 @@ class PathPipelineNode(Node):
         self._row_path_detection_stopped = False
         self._last_confirmed_output_paths.clear()
         self._last_confirmed_group_start_lines.clear()
+        self._rows_by_roi_strip.clear()
+        self._paths_by_roi_strip.clear()
+        self._last_discarded_fov_row_records.clear()
         self.path_start_tracker.reset()
         self.start_line_tracker.reset()
         self._eor_line_reference = None
@@ -541,6 +581,7 @@ class PathPipelineNode(Node):
         self._clear_path_pipeline_cycle_state()
         self._pending_clouds.clear()
         self._pending_rear_axle_markers.clear()
+        self._pending_chassis_front_markers.clear()
 
         if self.enable_path_publisher:
             paths = PoseArray()
@@ -585,7 +626,7 @@ class PathPipelineNode(Node):
 
         self._row_path_detection_stopped = True
         self.get_logger().info(
-            'Group-start distance crossed the falling stop threshold '
+            'Chassis-front-to-path-entrance distance crossed the falling stop threshold '
             f'({previous:.3f} -> {distance:.3f} m, threshold='
             f'{self.group_start_distance_stop_threshold:.3f} m). '
             'Row and path detection are now latched off.'
@@ -937,6 +978,27 @@ class PathPipelineNode(Node):
         self.rear_axle_path_distance_publisher.publish(Float64(data=distance))
         return distance
 
+    def _update_stop_from_chassis_front_group_start(
+        self, chassis_front_marker: Marker,
+    ) -> float | None:
+        """Publish and use the chassis-front distance to the nearest retained entrance line."""
+        if not self._retained_group_start_lines:
+            return None
+        chassis_front_xy = np.array([
+            chassis_front_marker.pose.position.x,
+            chassis_front_marker.pose.position.y,
+        ], dtype=float)
+        distance = min(
+            self._point_to_segment_distance(chassis_front_xy, line)
+            for line in self._retained_group_start_lines.values()
+        )
+        if self.enable_chassis_front_path_entrance_line_distance_publisher:
+            self.chassis_front_path_entrance_line_distance_publisher.publish(
+                Float64(data=distance)
+            )
+        self._update_group_start_distance_stop(distance)
+        return distance
+
     def _publish_paths(self, src_msg: PointCloud2, path_records: list[dict]) -> int:
         msg = PoseArray()
         msg.header = src_msg.header
@@ -1027,18 +1089,39 @@ class PathPipelineNode(Node):
             self._pending_rear_axle_markers.popitem(last=False)
             self.get_logger().warning('Dropping rear-axle marker without a matching world ROI cloud.')
 
+    def chassis_front_marker_callback(self, msg: Marker) -> None:
+        """Buffer the world-frame chassis-front marker for its matching ROI cloud."""
+        if msg.header.frame_id != 'world' or msg.ns != 'chassis_front_world':
+            return
+        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        self._pending_chassis_front_markers[stamp] = msg
+        self._pending_chassis_front_markers.move_to_end(stamp)
+        self._try_process_synchronized_stamp(stamp)
+        while len(self._pending_chassis_front_markers) > self.sync_queue_size:
+            self._pending_chassis_front_markers.popitem(last=False)
+            self.get_logger().warning('Dropping chassis-front marker without a matching world ROI cloud.')
+
     def _try_process_synchronized_stamp(self, stamp: tuple[int, int]) -> None:
-        if stamp not in self._pending_clouds or stamp not in self._pending_rear_axle_markers:
+        if (
+            stamp not in self._pending_clouds
+            or stamp not in self._pending_rear_axle_markers
+            or stamp not in self._pending_chassis_front_markers
+        ):
             return
         if self.enable_fov_boundary_row_filter and stamp not in self._pending_fov_markers:
             return
         cloud = self._pending_clouds.pop(stamp)
         fov_marker = self._pending_fov_markers.pop(stamp, None)
         rear_axle_marker = self._pending_rear_axle_markers.pop(stamp)
-        self._process_cloud(cloud, rear_axle_marker, fov_marker)
+        chassis_front_marker = self._pending_chassis_front_markers.pop(stamp)
+        self._process_cloud(cloud, rear_axle_marker, chassis_front_marker, fov_marker)
 
     def _process_cloud(
-        self, msg: PointCloud2, rear_axle_marker: Marker, fov_marker: Marker | None = None,
+        self,
+        msg: PointCloud2,
+        rear_axle_marker: Marker,
+        chassis_front_marker: Marker,
+        fov_marker: Marker | None = None,
     ) -> None:
         self.frame_count += 1
         stamp_sec = msg.header.stamp.sec
@@ -1076,20 +1159,51 @@ class PathPipelineNode(Node):
         published_row_markers = -1
         published_group_start_distance: float | None = None
         rear_axle_path_distance: float | None = None
+        chassis_front_group_start_distance: float | None = None
         group_start_lines_count = -1
         output_paths: list[dict] = []
         group_start_lines: list[dict] = []
+        # Each strip has its own detection history.  A failed RANSAC fit in
+        # one strip must not erase rows or paths previously found there when
+        # another strip succeeds on the same cloud.
+        for row in row_records:
+            strip_id = row.get('roi_strip_id')
+            if isinstance(strip_id, (int, np.integer)) and strip_id > 0:
+                self._rows_by_roi_strip[int(strip_id)] = dict(row)
+        if discarded_fov_rows:
+            self._last_discarded_fov_row_records = [dict(row) for row in discarded_fov_rows]
+        cached_rows = [
+            dict(self._rows_by_roi_strip[strip_id])
+            for strip_id in sorted(self._rows_by_roi_strip)
+        ]
         if self.enable_row_marker_publisher:
-            published_row_markers = self._publish_row_markers(msg, row_records)
+            published_row_markers = self._publish_row_markers(
+                msg, cached_rows,
+            )
         if bool(getattr(self, 'enable_discarded_fov_row_marker_publisher', False)):
-            self._publish_discarded_fov_row_markers(msg, discarded_fov_rows)
+            self._publish_discarded_fov_row_markers(
+                msg, self._last_discarded_fov_row_records,
+            )
 
         if self.enable_path_detection and not self._row_path_detection_stopped and row_records:
-            path_records = build_paths_from_rows(
+            fresh_path_records = build_paths_from_rows(
                 row_records,
                 min_path_length=self.min_path_length,
             )
-            paths_detected = len(path_records)
+            paths_detected = len(fresh_path_records)
+            for path in fresh_path_records:
+                strip_id = path.get('roi_strip_id')
+                if isinstance(strip_id, (int, np.integer)) and strip_id > 0:
+                    self._paths_by_roi_strip[int(strip_id)] = dict(path)
+
+            # Path IDs are assigned again after merging the per-strip cache,
+            # so marker IDs and group construction remain unique and stable
+            # within this published result.
+            path_records = []
+            for path_id, strip_id in enumerate(sorted(self._paths_by_roi_strip), start=1):
+                path = dict(self._paths_by_roi_strip[strip_id])
+                path['path_id'] = path_id
+                path_records.append(path)
 
             if self.enable_parallel_correction and path_records:
                 groups = build_path_groups(
@@ -1119,6 +1233,11 @@ class PathPipelineNode(Node):
                         self._eor_line_reference,
                         self._eor_line_direction,
                     )
+                # A single accumulated cloud can fail RANSAC even though the
+                # ROI cycle has not ended. Keep the most recent valid geometry
+                # visible while still attempting fresh detection on every cloud.
+                if not output_paths and self._last_confirmed_output_paths:
+                    output_paths = [dict(record) for record in self._last_confirmed_output_paths]
                 if self.enable_parallel_correction:
                     if (
                         self.enable_path_start_tracking
@@ -1149,7 +1268,12 @@ class PathPipelineNode(Node):
                     ]
 
             published_group_start_distance = self._publish_group_start_distance(
-                rear_axle_marker, group_start_lines, stamp_ns,
+                rear_axle_marker,
+                group_start_lines,
+                stamp_ns,
+            )
+            chassis_front_group_start_distance = self._update_stop_from_chassis_front_group_start(
+                chassis_front_marker,
             )
 
             # The threshold can be crossed on a scan without a new detection.
@@ -1165,17 +1289,14 @@ class PathPipelineNode(Node):
                 published_paths = self._publish_paths(msg, output_paths)
 
             if self.enable_marker_publisher:
-                published_markers = self._publish_debug_markers(msg, output_paths, group_start_lines)
+                published_markers = self._publish_debug_markers(
+                    msg, output_paths, group_start_lines,
+                )
 
-        if (
-            self.enable_rear_axle_path_distance_publisher
-            and rear_axle_marker is not None
-            and output_paths
-        ):
+        if self.enable_rear_axle_path_distance_publisher and output_paths:
             rear_axle_path_distance = self._publish_rear_axle_path_distance(
                 rear_axle_marker, output_paths,
             )
-
         self.get_logger().info(
             f'Lidar messages are received | frame={self.frame_count} '
             f'| stamp={stamp_sec}.{stamp_nsec:09d} '
@@ -1190,6 +1311,8 @@ class PathPipelineNode(Node):
             f'| group_start_lines={group_start_lines_count} '
             f'| group_start_distance={published_group_start_distance} '
             f'| rear_axle_path_distance={rear_axle_path_distance} '
+            f'| chassis_front_path_entrance_line_distance='
+            f'{chassis_front_group_start_distance} '
             f'| detection_stopped={self._row_path_detection_stopped} '
             f'| published_paths={published_paths} '
             f'| published_markers={published_markers} '
