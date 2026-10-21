@@ -83,8 +83,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{{
                 'sampling_period_sec': 0.0,
-                'accumulated_cloud_count': 30,
-                'voxel_size_m': 0.02,
+                'accumulated_cloud_count': 10,
                 'path_pipeline_reset_topic': '/pernav/path_pipeline_reset',
             }}],
         ),

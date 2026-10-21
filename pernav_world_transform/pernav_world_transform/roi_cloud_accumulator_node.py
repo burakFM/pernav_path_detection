@@ -12,7 +12,7 @@ from visualization_msgs.msg import Marker
 
 
 class RoiCloudAccumulatorNode(Node):
-    """Publish an XY-voxelized rolling accumulation of every ROI cloud."""
+    """Publish a rolling accumulation of every ROI cloud."""
 
     def __init__(self) -> None:
         super().__init__('roi_cloud_accumulator_node')
@@ -25,8 +25,7 @@ class RoiCloudAccumulatorNode(Node):
                 # Zero means accept every input cloud.  A positive value can
                 # optionally be used to decimate an unusually fast source.
                 ('sampling_period_sec', 0.0),
-                ('accumulated_cloud_count', 30),
-                ('voxel_size_m', 0.02),
+                ('accumulated_cloud_count', 10),
                 ('path_pipeline_reset_topic', '/pernav/path_pipeline_reset'),
             ],
         )
@@ -36,7 +35,6 @@ class RoiCloudAccumulatorNode(Node):
         self.roi_marker_topic = str(self.get_parameter('roi_marker_topic').value)
         self.sampling_period_sec = float(self.get_parameter('sampling_period_sec').value)
         self.accumulated_cloud_count = int(self.get_parameter('accumulated_cloud_count').value)
-        self.voxel_size_m = float(self.get_parameter('voxel_size_m').value)
         self.path_pipeline_reset_topic = str(
             self.get_parameter('path_pipeline_reset_topic').value
         )
@@ -44,8 +42,6 @@ class RoiCloudAccumulatorNode(Node):
             raise ValueError('sampling_period_sec must be finite and non-negative.')
         if self.accumulated_cloud_count < 1:
             raise ValueError('accumulated_cloud_count must be at least one.')
-        if not np.isfinite(self.voxel_size_m) or self.voxel_size_m <= 0.0:
-            raise ValueError('voxel_size_m must be finite and positive.')
 
         self._clouds: deque[np.ndarray] = deque(maxlen=self.accumulated_cloud_count)
         self._last_accepted_stamp_ns: int | None = None
@@ -77,8 +73,7 @@ class RoiCloudAccumulatorNode(Node):
             f'{self.input_pointcloud_topic} -> {self.output_pointcloud_topic} '
             f'| roi_marker={self.roi_marker_topic} '
             f'| sample_period={self.sampling_period_sec:.3f}s (0=every cloud) '
-            f'| cloud_count={self.accumulated_cloud_count} '
-            f'| xy_voxel={self.voxel_size_m:.3f}m'
+            f'| cloud_count={self.accumulated_cloud_count}'
         )
 
     @staticmethod
@@ -116,13 +111,6 @@ class RoiCloudAccumulatorNode(Node):
         cloud.is_dense = True
         cloud.data = points.tobytes()
         return cloud
-
-    def _voxel_downsample_xy(self, points_xyz: np.ndarray) -> np.ndarray:
-        if points_xyz.size == 0:
-            return points_xyz
-        voxel_indices = np.floor(points_xyz[:, :2] / self.voxel_size_m).astype(np.int64)
-        _, first_indices = np.unique(voxel_indices, axis=0, return_index=True)
-        return points_xyz[np.sort(first_indices)]
 
     def roi_marker_callback(self, msg: Marker) -> None:
         """Store the frozen rectangle published by roi_filter_node."""
@@ -221,8 +209,7 @@ class RoiCloudAccumulatorNode(Node):
         self._last_source_msg = msg
         merged = np.concatenate(tuple(self._clouds), axis=0)
         clipped = self._clip_to_roi(merged)
-        downsampled = self._voxel_downsample_xy(clipped)
-        self.publisher.publish(self._build_xyz_cloud(downsampled, msg))
+        self.publisher.publish(self._build_xyz_cloud(clipped, msg))
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         if now_sec - self._last_log_sec >= 1.0:
@@ -230,7 +217,7 @@ class RoiCloudAccumulatorNode(Node):
                 f'Published accumulated ROI cloud | clouds={len(self._clouds)}/'
                 f'{self.accumulated_cloud_count} | merged_points={len(merged)} '
                 f'| roi_points={len(clipped)} '
-                f'| voxel_points={len(downsampled)}'
+                f'| published_points={len(clipped)}'
             )
             self._last_log_sec = now_sec
 
