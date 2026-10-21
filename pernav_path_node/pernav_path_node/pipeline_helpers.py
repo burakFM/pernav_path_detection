@@ -9,16 +9,17 @@ def ransac_line_2d_continuous(
     max_gap: float,
     max_iterations: int,
     min_segment_inliers: int,
-) -> tuple[tuple[float, float, float] | None, np.ndarray | None]:
+) -> tuple[tuple[float, float, float] | None, np.ndarray | None, float, float]:
     """Detect one dominant continuous 2D line segment using random sampling."""
     n_points = len(points)
     if n_points < 2:
-        return None, None
+        return None, None, -1.0, 0.0
 
     rng = np.random.default_rng(0)
     best_line = None
     best_segment_mask = None
     best_score = -1.0
+    best_segment_length = 0.0
 
     for _ in range(max_iterations):
         idx1, idx2 = rng.choice(n_points, size=2, replace=False)
@@ -64,8 +65,9 @@ def ransac_line_2d_continuous(
             best_line = (a, b, c)
             best_segment_mask = np.zeros(n_points, dtype=bool)
             best_segment_mask[largest_segment] = True
+            best_segment_length = segment_length
 
-    return best_line, best_segment_mask
+    return best_line, best_segment_mask, best_score, best_segment_length
 
 
 def detect_rows_count(
@@ -129,7 +131,7 @@ def detect_rows_from_xy(
     eor_normal = np.array([-eor_direction[1], eor_direction[0]], dtype=float)
 
     for _ in range(max_rows):
-        line_k, inlier_mask_k = ransac_line_2d_continuous(
+        line_k, inlier_mask_k, ransac_score, ransac_segment_length = ransac_line_2d_continuous(
             working_points,
             distance_threshold=distance_threshold,
             max_gap=max_gap,
@@ -186,6 +188,10 @@ def detect_rows_from_xy(
                 'B': float(b_k),
                 'C': float(c_k),
                 'inlier_count': int(np.sum(inlier_mask_k)),
+                'ransac_input_point_count': int(working_points.shape[0]),
+                'ransac_inlier_ratio': float(np.mean(inlier_mask_k)),
+                'ransac_score': float(ransac_score),
+                'ransac_segment_length': float(ransac_segment_length),
                 'start_x': float(p_start[0]),
                 'start_y': float(p_start[1]),
                 'end_x': float(p_end[0]),

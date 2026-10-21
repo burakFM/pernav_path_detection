@@ -12,6 +12,7 @@
 
 import math
 import struct
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -38,6 +39,7 @@ class PathPipelineNode(Node):
     def __init__(self) -> None:
         super().__init__('path_pipeline_node')
         self.frame_count = 0
+        self._last_processed_cloud_stamp_ns: int | None = None
 
         # Centralized node parameters
         self.declare_parameters(
@@ -495,6 +497,7 @@ class PathPipelineNode(Node):
     def _clear_path_pipeline_cycle_state(self) -> None:
         self._retained_group_start_lines.clear()
         self._last_group_start_distance_stamp_ns = None
+        self._last_processed_cloud_stamp_ns = None
         self._previous_group_start_distance = None
         self._row_path_detection_stopped = False
         self._last_confirmed_output_paths.clear()
@@ -564,11 +567,11 @@ class PathPipelineNode(Node):
     def _detect_rows_in_roi_strips(
         self,
         xy_roi: np.ndarray,
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict], int, list[float]]:
         normal = self._roi_strip_normal
         boundaries = self._roi_strip_boundaries
         if self._eor_line_reference is None or self._eor_line_direction is None:
-            return [], 0
+            return [], 0, []
         if (
             not self.enable_roi_strip_detection
             or normal is None
@@ -585,6 +588,7 @@ class PathPipelineNode(Node):
 
         row_records: list[dict] = []
         processed_regions = 0
+        strip_row_fit_ms: list[float] = []
         for region_id, region_points in enumerate(regions, start=1):
             # Each ROI strip represents one physical row. Stop once the
             # whole ROI reaches its cap, rather than applying the cap anew
@@ -594,6 +598,7 @@ class PathPipelineNode(Node):
             if region_points.shape[0] < self.row_min_segment_inliers:
                 continue
             processed_regions += 1
+            row_fit_started = time.perf_counter()
             region_rows = detect_rows_from_xy(
                 region_points,
                 distance_threshold=self.row_distance_threshold,
@@ -606,11 +611,12 @@ class PathPipelineNode(Node):
                 eor_line_reference=tuple(self._eor_line_reference),
                 eor_line_direction=tuple(self._eor_line_direction),
             )
+            strip_row_fit_ms.append((time.perf_counter() - row_fit_started) * 1_000.0)
             for row in region_rows:
                 row['row_id'] = len(row_records) + 1
                 row['roi_strip_id'] = region_id
                 row_records.append(row)
-        return row_records, processed_regions
+        return row_records, processed_regions, strip_row_fit_ms
 
     def path_pipeline_reset_callback(self, _msg: Empty) -> None:
         """Clear all state belonging to the completed ROI cycle."""
@@ -1231,10 +1237,15 @@ class PathPipelineNode(Node):
         chassis_front_marker: Marker,
         fov_marker: Marker | None = None,
     ) -> None:
+        callback_started = time.perf_counter()
         self.frame_count += 1
         stamp_sec = msg.header.stamp.sec
         stamp_nsec = msg.header.stamp.nanosec
         stamp_ns = stamp_sec * 1_000_000_000 + stamp_nsec
+        source_dt_ms: float | None = None
+        if self._last_processed_cloud_stamp_ns is not None:
+            source_dt_ms = (stamp_ns - self._last_processed_cloud_stamp_ns) * 1e-6
+        self._last_processed_cloud_stamp_ns = stamp_ns
         self._prepare_group_start_distance_stamp(stamp_ns)
         raw_count, xyz = self._pc2_to_xyz(msg)
         xy = xyz[:, :2]
@@ -1246,13 +1257,16 @@ class PathPipelineNode(Node):
         rows_detected = -1
         rows_discarded_fov = 0
         roi_strips_processed = 0
+        strip_row_fit_ms: list[float] = []
         row_records: list[dict] = []
         if (
             self.enable_row_detection
             and not self._row_path_detection_stopped
             and roi_xy_count >= self.row_min_segment_inliers
         ):
-            row_records, roi_strips_processed = self._detect_rows_in_roi_strips(xy_roi)
+            row_records, roi_strips_processed, strip_row_fit_ms = self._detect_rows_in_roi_strips(
+                xy_roi
+            )
             rows_detected = len(row_records)
         discarded_fov_rows: list[dict] = []
         fov_filter_enabled = bool(getattr(self, 'enable_fov_boundary_row_filter', False))
@@ -1405,6 +1419,22 @@ class PathPipelineNode(Node):
             rear_axle_path_distance = self._publish_rear_axle_path_distance(
                 rear_axle_marker, output_paths,
             )
+        row_fit_ms = sum(strip_row_fit_ms)
+        callback_ms = (time.perf_counter() - callback_started) * 1_000.0
+        source_dt_text = 'n/a' if source_dt_ms is None else f'{source_dt_ms:.1f}'
+        strip_row_fit_text = ','.join(f'{value:.1f}' for value in strip_row_fit_ms) or 'n/a'
+        accepted_ransac_lines = '; '.join(
+            'strip={strip} inliers={inliers}/{points} ratio={ratio:.1%} '
+            'score={score:.2f} segment_m={length:.2f}'.format(
+                strip=row.get('roi_strip_id', '?'),
+                inliers=row['inlier_count'],
+                points=row['ransac_input_point_count'],
+                ratio=row['ransac_inlier_ratio'],
+                score=row['ransac_score'],
+                length=row['ransac_segment_length'],
+            )
+            for row in row_records
+        ) or 'none'
         self.get_logger().info(
             f'Lidar messages are received | frame={self.frame_count} '
             f'| stamp={stamp_sec}.{stamp_nsec:09d} '
@@ -1412,6 +1442,12 @@ class PathPipelineNode(Node):
             f'| raw_points={raw_count} | valid_xyz_points={valid_xyz_count} '
             f'| roi_xy_points={roi_xy_count} '
             f'| roi_strips_processed={roi_strips_processed} '
+            f'| ransac_max_trials={roi_strips_processed * self.row_max_iterations} '
+            f'| row_fit_ms={row_fit_ms:.1f} '
+            f'| strip_row_fit_ms=[{strip_row_fit_text}] '
+            f'| accepted_ransac_lines=[{accepted_ransac_lines}] '
+            f'| callback_ms={callback_ms:.1f} '
+            f'| source_dt_ms={source_dt_text} '
             f'| rows_detected={rows_detected} '
             f'| rows_discarded_fov={rows_discarded_fov} '
             f'| paths_detected={paths_detected} '
