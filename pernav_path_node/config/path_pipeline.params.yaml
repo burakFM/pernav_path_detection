@@ -33,6 +33,9 @@ path_pipeline_node:
     chassis_front_marker_world_topic: /pernav/chassis_front_marker_world
     enable_chassis_front_path_entrance_line_distance_publisher: true
     chassis_front_path_entrance_line_distance_topic: /pernav/chassis_front_to_path_entrance_line_distance
+    enable_chassis_front_path_entrance_line_distance_marker: true
+    chassis_front_path_entrance_line_distance_marker_topic: /pernav/chassis_front_to_path_entrance_line_distance_marker
+    chassis_front_path_entrance_line_distance_text_marker_topic: /pernav/chassis_front_to_path_entrance_line_distance_text_marker
 
     # Tractor-relative ROI and chassis filters belong to rearaxle_to_world_node.
 

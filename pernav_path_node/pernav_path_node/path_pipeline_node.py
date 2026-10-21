@@ -59,6 +59,11 @@ class PathPipelineNode(Node):
                 ('enable_chassis_front_path_entrance_line_distance_publisher', True),
                 ('chassis_front_path_entrance_line_distance_topic',
                  '/pernav/chassis_front_to_path_entrance_line_distance'),
+                ('enable_chassis_front_path_entrance_line_distance_marker', True),
+                ('chassis_front_path_entrance_line_distance_marker_topic',
+                 '/pernav/chassis_front_to_path_entrance_line_distance_marker'),
+                ('chassis_front_path_entrance_line_distance_text_marker_topic',
+                 '/pernav/chassis_front_to_path_entrance_line_distance_text_marker'),
                 ('enable_row_detection', True),
                 ('row_distance_threshold', 0.1),
                 ('row_max_gap', 0.6),
@@ -165,6 +170,21 @@ class PathPipelineNode(Node):
         self.chassis_front_path_entrance_line_distance_topic = str(
             self.get_parameter(
                 'chassis_front_path_entrance_line_distance_topic'
+            ).value
+        )
+        self.enable_chassis_front_path_entrance_line_distance_marker = bool(
+            self.get_parameter(
+                'enable_chassis_front_path_entrance_line_distance_marker'
+            ).value
+        )
+        self.chassis_front_path_entrance_line_distance_marker_topic = str(
+            self.get_parameter(
+                'chassis_front_path_entrance_line_distance_marker_topic'
+            ).value
+        )
+        self.chassis_front_path_entrance_line_distance_text_marker_topic = str(
+            self.get_parameter(
+                'chassis_front_path_entrance_line_distance_text_marker_topic'
             ).value
         )
         self.enable_row_detection = bool(self.get_parameter('enable_row_detection').value)
@@ -275,6 +295,16 @@ class PathPipelineNode(Node):
         self.chassis_front_path_entrance_line_distance_publisher = self.create_publisher(
             Float64, self.chassis_front_path_entrance_line_distance_topic, 10,
         )
+        self.chassis_front_path_entrance_line_distance_marker_publisher = self.create_publisher(
+            Marker,
+            self.chassis_front_path_entrance_line_distance_marker_topic,
+            10,
+        )
+        self.chassis_front_path_entrance_line_distance_text_marker_publisher = self.create_publisher(
+            Marker,
+            self.chassis_front_path_entrance_line_distance_text_marker_topic,
+            10,
+        )
 
         if self.enable_notebook_plot or self.enable_plot_video:
             self._init_notebook_plot()
@@ -352,18 +382,24 @@ class PathPipelineNode(Node):
         )
 
     @staticmethod
-    def _point_to_segment_distance(point_xy: np.ndarray, line: dict) -> float:
-        """Return the shortest XY distance from a point to a finite line segment."""
+    def _closest_point_on_segment(point_xy: np.ndarray, line: dict) -> np.ndarray:
+        """Return the closest XY point on a finite line segment."""
         point = np.asarray(point_xy, dtype=float)
         p0 = np.array([line['start_x'], line['start_y']], dtype=float)
         p1 = np.array([line['end_x'], line['end_y']], dtype=float)
         segment = p1 - p0
         length_squared = float(segment @ segment)
         if length_squared <= 1e-12:
-            return float(np.linalg.norm(point - p0))
+            return p0
         projection = float((point - p0) @ segment) / length_squared
-        closest = p0 + np.clip(projection, 0.0, 1.0) * segment
-        return float(np.linalg.norm(point - closest))
+        return p0 + np.clip(projection, 0.0, 1.0) * segment
+
+    @classmethod
+    def _point_to_segment_distance(cls, point_xy: np.ndarray, line: dict) -> float:
+        """Return the shortest XY distance from a point to a finite line segment."""
+        return float(np.linalg.norm(
+            np.asarray(point_xy, dtype=float) - cls._closest_point_on_segment(point_xy, line)
+        ))
 
     @staticmethod
     def _point_to_ray_distance(point_xy: np.ndarray, origin_xy: np.ndarray, endpoint_xy: np.ndarray) -> float:
@@ -983,14 +1019,28 @@ class PathPipelineNode(Node):
     ) -> float | None:
         """Publish and use the chassis-front distance to the nearest retained entrance line."""
         if not self._retained_group_start_lines:
+            self._publish_chassis_front_entrance_line_distance_marker(
+                chassis_front_marker,
+                closest_point_xy=None,
+                distance=None,
+            )
             return None
         chassis_front_xy = np.array([
             chassis_front_marker.pose.position.x,
             chassis_front_marker.pose.position.y,
         ], dtype=float)
-        distance = min(
-            self._point_to_segment_distance(chassis_front_xy, line)
-            for line in self._retained_group_start_lines.values()
+        _, closest_point_xy = min(
+            (
+                (line, self._closest_point_on_segment(chassis_front_xy, line))
+                for line in self._retained_group_start_lines.values()
+            ),
+            key=lambda item: float(np.linalg.norm(chassis_front_xy - item[1])),
+        )
+        distance = float(np.linalg.norm(chassis_front_xy - closest_point_xy))
+        self._publish_chassis_front_entrance_line_distance_marker(
+            chassis_front_marker,
+            closest_point_xy=closest_point_xy,
+            distance=distance,
         )
         if self.enable_chassis_front_path_entrance_line_distance_publisher:
             self.chassis_front_path_entrance_line_distance_publisher.publish(
@@ -998,6 +1048,64 @@ class PathPipelineNode(Node):
             )
         self._update_group_start_distance_stop(distance)
         return distance
+
+    def _publish_chassis_front_entrance_line_distance_marker(
+        self,
+        chassis_front_marker: Marker,
+        *,
+        closest_point_xy: np.ndarray | None,
+        distance: float | None,
+    ) -> None:
+        """Visualize the exact synchronized distance used by the stop condition."""
+        if not self.enable_chassis_front_path_entrance_line_distance_marker:
+            return
+
+        if closest_point_xy is None or distance is None:
+            for marker_id, publisher in (
+                (0, self.chassis_front_path_entrance_line_distance_marker_publisher),
+                (1, self.chassis_front_path_entrance_line_distance_text_marker_publisher),
+            ):
+                delete = Marker()
+                delete.header = chassis_front_marker.header
+                delete.ns = 'pernav_chassis_front_entrance_line_distance'
+                delete.id = marker_id
+                delete.action = Marker.DELETE
+                publisher.publish(delete)
+            return
+
+        chassis = chassis_front_marker.pose.position
+        line_z = float(chassis.z)
+        closest = Point(x=float(closest_point_xy[0]), y=float(closest_point_xy[1]), z=line_z)
+
+        line = Marker()
+        line.header = chassis_front_marker.header
+        line.ns = 'pernav_chassis_front_entrance_line_distance'
+        line.id = 0
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.points = [Point(x=float(chassis.x), y=float(chassis.y), z=line_z), closest]
+        line.scale.x = 0.04
+        line.color.r, line.color.g, line.color.b, line.color.a = 0.0, 1.0, 1.0, 1.0
+        line.lifetime.sec = int(self.marker_lifetime_sec)
+        line.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
+        self.chassis_front_path_entrance_line_distance_marker_publisher.publish(line)
+
+        label = Marker()
+        label.header = chassis_front_marker.header
+        label.ns = 'pernav_chassis_front_entrance_line_distance'
+        label.id = 1
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        label.pose.position.x = 0.5 * (float(chassis.x) + float(closest_point_xy[0]))
+        label.pose.position.y = 0.5 * (float(chassis.y) + float(closest_point_xy[1]))
+        label.pose.position.z = line_z + 0.25
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.25
+        label.color.r, label.color.g, label.color.b, label.color.a = 0.0, 1.0, 1.0, 1.0
+        label.text = f'{distance:.3f} m'
+        label.lifetime.sec = int(self.marker_lifetime_sec)
+        label.lifetime.nanosec = int((self.marker_lifetime_sec % 1.0) * 1e9)
+        self.chassis_front_path_entrance_line_distance_text_marker_publisher.publish(label)
 
     def _publish_paths(self, src_msg: PointCloud2, path_records: list[dict]) -> int:
         msg = PoseArray()
