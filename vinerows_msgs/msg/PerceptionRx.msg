@@ -1,5 +1,0 @@
-std_msgs/Header header
-bool row_spacing_calib
-uint16 row_spacing_cm
-uint16 sensor_x_pos_cm
-uint16 implement_filter_cm
