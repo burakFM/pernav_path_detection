@@ -220,7 +220,7 @@ Invalid end-of-row XY entries are discarded; the ROI requires at least two remai
 | `pose_topic` | `/pose_rearAxle2worldGNSS` | Tractor pose used to select the closest EOR point |
 | `axes_marker_topic` | `/roi_markers_axes` | Experimental repeated driving-axis line marker |
 | `activation_distance` | `1.0` | Activate when distance crosses downward through this value, in metres |
-| `upper_offset` | `4.0` | Corridor extent on the positive-normal side, in metres |
+| `upper_offset` | `6.0` | Corridor extent on the positive-normal side, in metres |
 | `lower_offset` | `-0.5` | Corridor extent on the negative-normal side, in metres |
 | `roi_line_extension` | `10.0` | Extension beyond both ends of the fitted line, in metres |
 | `group_start_distance_topic` | `/pernav/group_start_line_distance` | Distance used to complete an active cycle |

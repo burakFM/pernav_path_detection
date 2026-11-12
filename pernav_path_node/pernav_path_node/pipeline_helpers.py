@@ -3,112 +3,90 @@ import math
 import numpy as np
 
 
-def ransac_line_2d_continuous(
+def trimmed_pca_line_2d(
     points: np.ndarray,
-    distance_threshold: float,
-    max_gap: float,
-    max_iterations: int,
+    keep_fraction: float,
     min_segment_inliers: int,
 ) -> tuple[tuple[float, float, float] | None, np.ndarray | None, float, float]:
-    """Detect one dominant continuous 2D line segment using random sampling."""
+    """Fit a deterministic line after retaining points closest to an initial PCA line."""
     n_points = len(points)
-    if n_points < 2:
+    if n_points < min_segment_inliers:
         return None, None, -1.0, 0.0
 
-    rng = np.random.default_rng(0)
-    best_line = None
-    best_segment_mask = None
-    best_score = -1.0
-    best_segment_length = 0.0
+    initial_origin = np.mean(points, axis=0)
+    _, _, right_singular_vectors = np.linalg.svd(
+        points - initial_origin,
+        full_matrices=False,
+    )
+    initial_direction = right_singular_vectors[0]
+    direction_norm = float(np.linalg.norm(initial_direction))
+    if direction_norm <= 1e-9:
+        return None, None, -1.0, 0.0
+    initial_direction /= direction_norm
+    initial_normal = np.array([-initial_direction[1], initial_direction[0]], dtype=float)
+    residuals = np.abs((points - initial_origin) @ initial_normal)
 
-    for _ in range(max_iterations):
-        idx1, idx2 = rng.choice(n_points, size=2, replace=False)
-        p1, p2 = points[idx1], points[idx2]
+    keep_count = max(min_segment_inliers, int(math.ceil(n_points * keep_fraction)))
+    keep_count = min(keep_count, n_points)
+    selected_indices = np.argpartition(residuals, keep_count - 1)[:keep_count]
+    selected_points = points[selected_indices]
 
-        direction = p2 - p1
-        direction_length = float(np.linalg.norm(direction))
-        if direction_length < 1e-8:
-            continue
-
-        unit_direction = direction / direction_length
-
-        a = float(direction[1])
-        b = float(-direction[0])
-        c = float(-(a * p1[0] + b * p1[1]))
-        normal_length = math.sqrt(a * a + b * b)
-
-        distances = np.abs(a * points[:, 0] + b * points[:, 1] + c) / normal_length
-        initial_inlier_indices = np.where(distances < distance_threshold)[0]
-        if len(initial_inlier_indices) < min_segment_inliers:
-            continue
-
-        inlier_points = points[initial_inlier_indices]
-        projections = inlier_points @ unit_direction
-        order = np.argsort(projections)
-        sorted_indices = initial_inlier_indices[order]
-        sorted_projections = projections[order]
-
-        gaps = np.diff(sorted_projections)
-        split_positions = np.where(gaps > max_gap)[0] + 1
-        segments = np.split(sorted_indices, split_positions)
-        largest_segment = max(segments, key=len)
-        if len(largest_segment) < min_segment_inliers:
-            continue
-
-        segment_points = points[largest_segment]
-        segment_projections = segment_points @ unit_direction
-        segment_length = float(segment_projections.max() - segment_projections.min())
-
-        score = float(len(largest_segment)) + segment_length
-        if score > best_score:
-            best_score = score
-            best_line = (a, b, c)
-            best_segment_mask = np.zeros(n_points, dtype=bool)
-            best_segment_mask[largest_segment] = True
-            best_segment_length = segment_length
-
-    return best_line, best_segment_mask, best_score, best_segment_length
+    selected_origin = np.mean(selected_points, axis=0)
+    _, _, right_singular_vectors = np.linalg.svd(
+        selected_points - selected_origin,
+        full_matrices=False,
+    )
+    selected_direction = right_singular_vectors[0]
+    direction_norm = float(np.linalg.norm(selected_direction))
+    if direction_norm <= 1e-9:
+        return None, None, -1.0, 0.0
+    selected_direction /= direction_norm
+    selected_normal = np.array([-selected_direction[1], selected_direction[0]], dtype=float)
+    line = (
+        float(selected_normal[0]),
+        float(selected_normal[1]),
+        float(-(selected_normal @ selected_origin)),
+    )
+    projections = (selected_points - selected_origin) @ selected_direction
+    segment_length = float(projections.max() - projections.min())
+    selected_mask = np.zeros(n_points, dtype=bool)
+    selected_mask[selected_indices] = True
+    return line, selected_mask, float(keep_count) + segment_length, segment_length
 
 
 def detect_rows_count(
     xy: np.ndarray,
-    distance_threshold: float,
-    max_gap: float,
-    max_iterations: int,
     min_segment_inliers: int,
     max_rows: int,
     remove_radius: float,
     min_points_left: int,
     eor_line_reference: tuple[float, float],
     eor_line_direction: tuple[float, float],
+    trimmed_pca_keep_fraction: float = 0.9,
 ) -> int:
     """Iteratively detect and remove row-like line segments; return detected row count."""
     row_records = detect_rows_from_xy(
         xy,
-        distance_threshold=distance_threshold,
-        max_gap=max_gap,
-        max_iterations=max_iterations,
         min_segment_inliers=min_segment_inliers,
         max_rows=max_rows,
         remove_radius=remove_radius,
         min_points_left=min_points_left,
         eor_line_reference=eor_line_reference,
         eor_line_direction=eor_line_direction,
+        trimmed_pca_keep_fraction=trimmed_pca_keep_fraction,
     )
     return len(row_records)
 
 
 def detect_rows_from_xy(
     xy: np.ndarray,
-    distance_threshold: float,
-    max_gap: float,
-    max_iterations: int,
     min_segment_inliers: int,
     max_rows: int,
     remove_radius: float,
     min_points_left: int,
     eor_line_reference: tuple[float, float],
     eor_line_direction: tuple[float, float],
+    trimmed_pca_keep_fraction: float = 0.9,
 ) -> list[dict]:
     """Detect row segments oriented with their starts nearest the EOR line."""
     if xy.size == 0:
@@ -129,13 +107,13 @@ def detect_rows_from_xy(
         return []
     eor_direction /= direction_length
     eor_normal = np.array([-eor_direction[1], eor_direction[0]], dtype=float)
+    if not 0.0 < trimmed_pca_keep_fraction <= 1.0:
+        raise ValueError('trimmed_pca_keep_fraction must be in (0, 1].')
 
     for _ in range(max_rows):
-        line_k, inlier_mask_k, ransac_score, ransac_segment_length = ransac_line_2d_continuous(
+        line_k, inlier_mask_k, fit_score, fit_segment_length = trimmed_pca_line_2d(
             working_points,
-            distance_threshold=distance_threshold,
-            max_gap=max_gap,
-            max_iterations=max_iterations,
+            keep_fraction=trimmed_pca_keep_fraction,
             min_segment_inliers=min_segment_inliers,
         )
 
@@ -147,9 +125,8 @@ def detect_rows_from_xy(
         if seg_points.shape[0] < min_segment_inliers:
             break
 
-        # RANSAC robustly chooses the continuous inlier segment.  Fit that
-        # selected segment with total least squares (PCA) so the published
-        # row uses every inlier rather than the two points of the RANSAC draw.
+        # Fit the selected points with total least squares (PCA) so the
+        # published row uses all retained points.
         line_org = np.mean(seg_points, axis=0)
         _, _, right_singular_vectors = np.linalg.svd(
             seg_points - line_org,
@@ -161,10 +138,10 @@ def detect_rows_from_xy(
             break
         line_dir /= line_dir_norm
 
-        # Keep a stable orientation relative to the winning RANSAC proposal.
-        ransac_dir = np.array([-b_k, a_k], dtype=float)
-        ransac_dir /= np.linalg.norm(ransac_dir)
-        if float(line_dir @ ransac_dir) < 0.0:
+        # Keep a stable orientation relative to the initial fit proposal.
+        proposal_dir = np.array([-b_k, a_k], dtype=float)
+        proposal_dir /= np.linalg.norm(proposal_dir)
+        if float(line_dir @ proposal_dir) < 0.0:
             line_dir = -line_dir
 
         line_normal = np.array([-line_dir[1], line_dir[0]], dtype=float)
@@ -188,10 +165,10 @@ def detect_rows_from_xy(
                 'B': float(b_k),
                 'C': float(c_k),
                 'inlier_count': int(np.sum(inlier_mask_k)),
-                'ransac_input_point_count': int(working_points.shape[0]),
-                'ransac_inlier_ratio': float(np.mean(inlier_mask_k)),
-                'ransac_score': float(ransac_score),
-                'ransac_segment_length': float(ransac_segment_length),
+                'fit_input_point_count': int(working_points.shape[0]),
+                'fit_inlier_ratio': float(np.mean(inlier_mask_k)),
+                'fit_score': float(fit_score),
+                'fit_segment_length': float(fit_segment_length),
                 'start_x': float(p_start[0]),
                 'start_y': float(p_start[1]),
                 'end_x': float(p_end[0]),
@@ -207,6 +184,52 @@ def detect_rows_from_xy(
             break
 
     return row_records
+
+
+def align_rows_to_reference(row_records: list[dict]) -> list[dict]:
+    """Align row endpoints to the highest-inlier row without moving their starts."""
+    if len(row_records) < 2:
+        return [dict(row) for row in row_records]
+
+    reference_row = max(row_records, key=lambda row: int(row.get('inlier_count', 0)))
+    reference_start = np.array(
+        [reference_row['start_x'], reference_row['start_y']],
+        dtype=float,
+    )
+    reference_end = np.array(
+        [reference_row['end_x'], reference_row['end_y']],
+        dtype=float,
+    )
+    reference_direction = reference_end - reference_start
+    reference_length = float(np.linalg.norm(reference_direction))
+    if reference_length <= 1e-9:
+        return [dict(row) for row in row_records]
+    reference_direction /= reference_length
+    reference_normal = np.array(
+        [-reference_direction[1], reference_direction[0]],
+        dtype=float,
+    )
+
+    aligned_rows: list[dict] = []
+    for row in row_records:
+        aligned_row = dict(row)
+        if row is not reference_row:
+            start = np.array([row['start_x'], row['start_y']], dtype=float)
+            end = np.array([row['end_x'], row['end_y']], dtype=float)
+            length = float(np.linalg.norm(end - start))
+            if length > 1e-9:
+                aligned_end = start + length * reference_direction
+                aligned_row.update(
+                    {
+                        'A': float(reference_normal[0]),
+                        'B': float(reference_normal[1]),
+                        'C': float(-(reference_normal @ start)),
+                        'end_x': float(aligned_end[0]),
+                        'end_y': float(aligned_end[1]),
+                    }
+                )
+        aligned_rows.append(aligned_row)
+    return aligned_rows
 
 
 def build_paths_from_rows(
@@ -256,7 +279,7 @@ def build_paths_from_rows(
                 'path_id': len(path_records) + 1,
                 # A path occupies the corridor between this strip and the
                 # next one.  The pipeline uses this stable key to retain a
-                # path when another strip temporarily has no RANSAC result.
+                # path when another strip temporarily has no row-fit result.
                 'roi_strip_id': int(strip_id),
                 'row_a_id': int(row_i['row_id']),
                 'row_b_id': int(row_j['row_id']),

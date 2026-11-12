@@ -42,20 +42,15 @@ path_pipeline_node:
     # Enable/disable row detection stage in callback.
     enable_row_detection: true
 
-    # RANSAC inlier distance threshold to candidate row line [m].
-    row_distance_threshold: 0.1
-
-    # Maximum allowed gap along projected inlier sequence for one continuous row [m].
-    row_max_gap: 1.5
-
-    # Number of random RANSAC trials per row extraction cycle.
-    row_max_iterations: 500
+    # Fit PCA to a strip, retain this fraction of closest points, then fit the
+    # published PCA row.
+    trimmed_pca_keep_fraction: 0.9
 
     # Minimum inliers required to accept a detected row segment.
     row_min_segment_inliers: 10
 
-    # Global maximum rows accepted from one ROI frame. RANSAC selects only the
-    # strongest row in each ROI strip, then stops once this limit is reached.
+    # Global maximum rows accepted from one ROI frame. The detector selects one
+    # row per ROI strip, then stops once this limit is reached.
     row_max_rows: 10
 
     # After one row is found, remove nearby points within this perpendicular distance [m].
@@ -150,7 +145,7 @@ path_pipeline_node:
     # Output MarkerArray topic for current path lines and persistent confirmed entrances.
     marker_output_topic: /pernav/path_markers
 
-    # Publish every accepted RANSAC row from the current frame without tracking.
+    # Publish every accepted row from the current frame without tracking.
     enable_row_marker_publisher: true
     row_marker_output_topic: /pernav/detected_row_markers
 

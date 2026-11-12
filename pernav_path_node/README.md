@@ -33,7 +33,7 @@ flowchart LR
     R[/pernav/rear_axle_marker_world Marker/] --> S
     S --> B[Parse XYZ]
     B --> C[Project to XY]
-    C --> D[Row detection RANSAC]
+    C --> D[Trimmed PCA row detection]
     D --> X[Discard starts < 1 m from FOV boundary]
     X --> E[Build center paths]
     E --> F[Group paths]
@@ -57,7 +57,7 @@ flowchart LR
    by exact timestamp, then parse finite XYZ.
 2. Project the already-filtered world-frame cloud to XY and partition it into
     strips between consecutive `/roi_markers_axes` lines.
-3. Run continuous-row RANSAC independently in each strip, then combine and
+3. Fit a trimmed PCA row independently in each strip, then combine and
     renumber the detected rows. The endpoint with the
     smaller perpendicular distance to the frozen EOR line becomes the row start.
 4. Pair rows from consecutive ROI strips to create center paths; a missing
@@ -137,7 +137,7 @@ because their EOR-oriented start is closer than `fov_boundary_min_distance_m` to
 world FOV boundary ray are published in red on `/pernav/discarded_fov_row_markers`.
 Row IDs are local to each frame. Rows and paths are retained independently for
 each ROI strip: a fresh result from one strip updates only that strip, while a
-temporary RANSAC failure in another strip keeps its last valid rows and entrance
+temporary row-fit failure in another strip keeps its last valid rows and entrance
 path. These per-strip caches clear on a path-pipeline cycle reset. Marker
 lifetime uses `marker_lifetime_sec` (default: 1.0 s).
 

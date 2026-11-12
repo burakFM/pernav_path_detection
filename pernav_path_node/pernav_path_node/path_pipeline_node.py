@@ -28,6 +28,7 @@ from .path_start_tracker import PathStartTracker
 from .start_line_tracker import StartLineTracker
 from .pipeline_helpers import (  # type: ignore[reportMissingImports]
     apply_parallel_correction,
+    align_rows_to_reference,
     build_group_start_lines,
     build_path_groups,
     build_paths_from_rows,
@@ -67,9 +68,7 @@ class PathPipelineNode(Node):
                 ('chassis_front_path_entrance_line_distance_text_marker_topic',
                  '/pernav/chassis_front_to_path_entrance_line_distance_text_marker'),
                 ('enable_row_detection', True),
-                ('row_distance_threshold', 0.1),
-                ('row_max_gap', 0.6),
-                ('row_max_iterations', 400),
+                ('trimmed_pca_keep_fraction', 0.9),
                 ('row_min_segment_inliers', 40),
                 ('row_max_rows', 10),
                 ('row_remove_radius', 1.9),
@@ -190,9 +189,11 @@ class PathPipelineNode(Node):
             ).value
         )
         self.enable_row_detection = bool(self.get_parameter('enable_row_detection').value)
-        self.row_distance_threshold = float(self.get_parameter('row_distance_threshold').value)
-        self.row_max_gap = float(self.get_parameter('row_max_gap').value)
-        self.row_max_iterations = int(self.get_parameter('row_max_iterations').value)
+        self.trimmed_pca_keep_fraction = float(
+            self.get_parameter('trimmed_pca_keep_fraction').value
+        )
+        if not 0.0 < self.trimmed_pca_keep_fraction <= 1.0:
+            raise ValueError('trimmed_pca_keep_fraction must be in (0, 1].')
         self.row_min_segment_inliers = int(self.get_parameter('row_min_segment_inliers').value)
         self.row_max_rows = int(self.get_parameter('row_max_rows').value)
         self.row_remove_radius = float(self.get_parameter('row_remove_radius').value)
@@ -601,15 +602,13 @@ class PathPipelineNode(Node):
             row_fit_started = time.perf_counter()
             region_rows = detect_rows_from_xy(
                 region_points,
-                distance_threshold=self.row_distance_threshold,
-                max_gap=self.row_max_gap,
-                max_iterations=self.row_max_iterations,
                 min_segment_inliers=self.row_min_segment_inliers,
                 max_rows=1,
                 remove_radius=self.row_remove_radius,
                 min_points_left=self.row_min_points_left,
                 eor_line_reference=tuple(self._eor_line_reference),
                 eor_line_direction=tuple(self._eor_line_direction),
+                trimmed_pca_keep_fraction=self.trimmed_pca_keep_fraction,
             )
             strip_row_fit_ms.append((time.perf_counter() - row_fit_started) * 1_000.0)
             for row in region_rows:
@@ -1273,6 +1272,7 @@ class PathPipelineNode(Node):
         if fov_filter_enabled and fov_marker is not None and row_records:
             row_records, discarded_fov_rows = self._filter_rows_by_fov_boundary(row_records, fov_marker)
             rows_discarded_fov = len(discarded_fov_rows)
+        row_records = align_rows_to_reference(row_records)
 
         paths_detected = -1
         groups_detected = -1
@@ -1285,7 +1285,7 @@ class PathPipelineNode(Node):
         group_start_lines_count = -1
         output_paths: list[dict] = []
         group_start_lines: list[dict] = []
-        # Each strip has its own detection history.  A failed RANSAC fit in
+        # Each strip has its own detection history.  A failed row fit in
         # one strip must not erase rows or paths previously found there when
         # another strip succeeds on the same cloud.
         for row in row_records:
@@ -1355,7 +1355,7 @@ class PathPipelineNode(Node):
                         self._eor_line_reference,
                         self._eor_line_direction,
                     )
-                # A single accumulated cloud can fail RANSAC even though the
+                # A single accumulated cloud can fail row fitting even though the
                 # ROI cycle has not ended. Keep the most recent valid geometry
                 # visible while still attempting fresh detection on every cloud.
                 if not output_paths and self._last_confirmed_output_paths:
@@ -1423,15 +1423,15 @@ class PathPipelineNode(Node):
         callback_ms = (time.perf_counter() - callback_started) * 1_000.0
         source_dt_text = 'n/a' if source_dt_ms is None else f'{source_dt_ms:.1f}'
         strip_row_fit_text = ','.join(f'{value:.1f}' for value in strip_row_fit_ms) or 'n/a'
-        accepted_ransac_lines = '; '.join(
+        accepted_row_fits = '; '.join(
             'strip={strip} inliers={inliers}/{points} ratio={ratio:.1%} '
             'score={score:.2f} segment_m={length:.2f}'.format(
                 strip=row.get('roi_strip_id', '?'),
                 inliers=row['inlier_count'],
-                points=row['ransac_input_point_count'],
-                ratio=row['ransac_inlier_ratio'],
-                score=row['ransac_score'],
-                length=row['ransac_segment_length'],
+                points=row['fit_input_point_count'],
+                ratio=row['fit_inlier_ratio'],
+                score=row['fit_score'],
+                length=row['fit_segment_length'],
             )
             for row in row_records
         ) or 'none'
@@ -1442,10 +1442,9 @@ class PathPipelineNode(Node):
             f'| raw_points={raw_count} | valid_xyz_points={valid_xyz_count} '
             f'| roi_xy_points={roi_xy_count} '
             f'| roi_strips_processed={roi_strips_processed} '
-            f'| ransac_max_trials={roi_strips_processed * self.row_max_iterations} '
             f'| row_fit_ms={row_fit_ms:.1f} '
             f'| strip_row_fit_ms=[{strip_row_fit_text}] '
-            f'| accepted_ransac_lines=[{accepted_ransac_lines}] '
+            f'| accepted_row_fits=[{accepted_row_fits}] '
             f'| callback_ms={callback_ms:.1f} '
             f'| source_dt_ms={source_dt_text} '
             f'| rows_detected={rows_detected} '

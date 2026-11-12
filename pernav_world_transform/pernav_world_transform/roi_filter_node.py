@@ -41,7 +41,7 @@ class RoiFilterNode(Node):
                 ('pose_topic', '/pose_rearAxle2worldGNSS'),
                 ('axes_marker_topic', '/roi_markers_axes'),
                 ('activation_distance', 1.0),
-                ('upper_offset', 4.0),
+                ('upper_offset', 6.0),
                 ('lower_offset', -0.5),
                 ('roi_line_extension', 10.0),
                 ('group_start_distance_topic', '/pernav/group_start_line_distance'),

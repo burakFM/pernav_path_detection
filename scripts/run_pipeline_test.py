@@ -415,6 +415,9 @@ def validate_video(run_folder: Path) -> dict[str, Any]:
 
 
 def log_error_count(text: str) -> int:
+    shutdown_marker = "[WARNING] [launch]: user interrupted with ctrl-c (SIGINT)"
+    if shutdown_marker in text:
+        text = text.split(shutdown_marker, 1)[0]
     return sum(
         bool(re.search(r"\[ERROR\]|Traceback|process has died", line, re.IGNORECASE))
         for line in text.splitlines()
