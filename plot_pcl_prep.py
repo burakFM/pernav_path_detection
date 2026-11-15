@@ -25,6 +25,7 @@ retain original points. Set downsample_fitting=False for unsampled fitting.
 """
 
 import argparse
+import atexit
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -40,6 +41,17 @@ from rosbags.typesys import Stores, get_typestore
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 import skimage as ski
+
+
+log_file = None
+
+
+def log_print(*values, **kwargs):
+    """Print diagnostics to the terminal and the active run log."""
+    print(*values, **kwargs)
+    if log_file is not None:
+        print(*values, file=log_file, **kwargs)
+        log_file.flush()
 
 
 # %%########################################################################################
@@ -179,7 +191,7 @@ def load_gnss_window(bag_path, window_start_ns, window_end_ns):
         ):
             pose = reader.deserialize(raw_data, connection.msgtype)
             if pose.header.frame_id != "world" or (pose.child_frame_id != "rearAxleGNSS" and pose.child_frame_id != "rearAxleKF"):
-                print(f"Unexpected GNSS transform: {pose.header.frame_id} -> {pose.child_frame_id}")
+                log_print(f"Unexpected GNSS transform: {pose.header.frame_id} -> {pose.child_frame_id}")
                 raise ValueError("Expected GNSS transforms from rearAxleGNSS or rearAxleKF to world.")
             translation = pose.transform.translation
             if not np.isfinite([translation.x, translation.y, translation.z]).all():
@@ -367,6 +379,20 @@ def cloud_xyz(cloud):
     )
     xyz = np.column_stack([points[name].reshape(-1) for name in ("x", "y", "z")])
     return xyz[np.isfinite(xyz).all(axis=1)]
+
+
+def exclude_chassis_points(
+    points, x_min=0.0, x_max=4.0, y_min=-1.0, y_max=1.0
+):
+    """Remove points inside the rear-axle-frame chassis exclusion rectangle."""
+    points = np.asarray(points, dtype=float)
+    inside_chassis = (
+        (points[:, 0] >= x_min)
+        & (points[:, 0] <= x_max)
+        & (points[:, 1] >= y_min)
+        & (points[:, 1] <= y_max)
+    )
+    return points[~inside_chassis]
 
 
 
@@ -665,6 +691,20 @@ def filter_starts_near_end_of_row(segment_starts, end_of_row_xyz, max_distance=2
     return [entry for entry, distance in zip(segment_starts, distances) if distance <= max_distance]
 
 
+def path_start_points_from_row_starts(segment_starts):
+    """Return midpoints of consecutive density-passing row starts."""
+    starts = sorted(
+        (entry for entry in segment_starts if entry[3]),
+        key=lambda entry: entry[0],
+    )
+    path_starts = [
+        (first[1] + second[1]) / 2.0
+        for first, second in zip(starts, starts[1:])
+        if second[0] == first[0] + 1
+    ]
+    return np.asarray(path_starts, dtype=float).reshape(-1, 3)
+
+
 def fit_line_through_largest_heading_starts(segment_starts, common_heading):
     """Connect the two starts farthest along the supplied common XY heading.
 
@@ -951,7 +991,7 @@ def process_world_cloud(xyz_world, gnss_position, recorded_end_of_row_xyz, orien
         xyz_world, end_of_row_xyz, orientations, max_distance_after_end_of_row
     )
     segments, ids, fov_excluded_segments = exclude_segments_near_lidar_fov(
-        segments, ids, gnss_position, gnss_heading, distance=0.5,
+        segments, ids, gnss_position, gnss_heading, distance=segment_fov_distance,
         fov_angle_deg=lidar_fov_angle_deg,
     )
 
@@ -999,13 +1039,17 @@ def process_world_cloud(xyz_world, gnss_position, recorded_end_of_row_xyz, orien
             start_point_min_neighbors, start_point_neighbor_radius,
         )
         starts = project_segment_starts_onto_fit_lines(starts, common_fits)
-        starts = filter_starts_near_end_of_row(
-            starts, end_of_row_xyz, start_point_max_end_of_row_distance
-        )
+        if len(end_of_row_xyz):
+            starts = filter_starts_near_end_of_row(
+                starts, end_of_row_xyz, start_point_max_end_of_row_distance
+            )
+        else:
+            log_print("No end-of-row points available; skipping start-to-EOR distance filter.")
         starts = filter_starts_away_from_lidar_fov(
             starts, gnss_position, gnss_heading, margin_fov_distance, lidar_fov_angle_deg
         )
     start_line = fit_line_through_all_starts(starts, heading)
+    path_start_points = path_start_points_from_row_starts(starts)
     transform = estimate_start_to_midpoint_transform(start_line, midpoints)
     transformed_midpoints = None
     transformed_end_of_row_xyz = None
@@ -1030,6 +1074,7 @@ def process_world_cloud(xyz_world, gnss_position, recorded_end_of_row_xyz, orien
         "boundaries": boundaries, "origin": origin, "direction": direction,
         "individual_fits": individual_fits, "common_fits": common_fits,
         "fit_count": fit_count, "segment_starts": starts, "start_line_fit": start_line,
+        "path_start_points": path_start_points,
         "start_midpoint_transform": transform,
         "transformed_midpoints": transformed_midpoints,
         "transformed_end_of_row_xyz": transformed_end_of_row_xyz,
@@ -1037,7 +1082,7 @@ def process_world_cloud(xyz_world, gnss_position, recorded_end_of_row_xyz, orien
         "ransac_outliers": np.vstack(rejected) if rejected else np.empty((0, 3)),
     }
     result["computation_time_ms"] = (perf_counter() - computation_start) * 1000.0
-    print(f"process_world_cloud computation time: {result['computation_time_ms']:.3f} ms")
+    log_print(f"process_world_cloud computation time: {result['computation_time_ms']:.3f} ms")
     return result
 
 
@@ -1049,28 +1094,58 @@ def process_world_cloud(xyz_world, gnss_position, recorded_end_of_row_xyz, orien
 ###########################################################################################
 
 # Load bag folder and topic
-bag_folder = "C:\\Users\\edward.kikken\\OneDrive - Flanders Make vzw\\Documenten\\66_PERNAV\\Jetson_logs\\2026-10-13_17-07-26"
+#bag_folder = "/home/burak.erdogan/Desktop/Projects/Pernav/data/Linden/transfer_593112_files_aa814d31/SPE_2026-06-11_LindenReplay/2026-06-11_10-46-10/rosbag2_2026_09_14-15_52_20"
+bag_folder = "/home/burak.erdogan/Desktop/Projects/Pernav/data/2026-09-30_16-40-44/rosbag2_min4_to_min9/rosbag2_min4_to_min9_30s_to_120s_exact"
+#bag_folder = "C:\\Users\\edward.kikken\\OneDrive - Flanders Make vzw\\Documenten\\66_PERNAV\\Jetson_logs\\2026-10-13_17-07-26"
+#bag_folder = "/home/burak.erdogan/Desktop/Projects/Pernav/data/fixed_data/first_90s"
+#bag_folder = "/home/burak.erdogan/Desktop/Projects/Pernav/data/fixed_data"
 bag_topic = "/pcl_prep"
 lidar_pose_topic = "/pose_lidar2rearAxle"
 gnss_topic = "/pose_rearAxle2worldGNSS" 
 end_of_row_topic = "/end_of_row"
 NANOSECONDS = 1_000_000_000
+enable_chassis_exclusion = True
+chassis_exclusion_x_min = 0.0
+chassis_exclusion_x_max = 4.2
+chassis_exclusion_y_min = -1.0
+chassis_exclusion_y_max = 1.0
 
+# min4 - min9 = 30 - 45
+# fixed data timestamps = 238 - 246
+# linden 10_46 2026_09_14 = 205 - 215
 # time and stitching window settings
-for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compute and plot
-    timestamp_seconds = str(timestamp_seconds)
+timestamp_start_seconds = 30
+timestamp_end_seconds = 45
+timestamp_step_seconds = 1
+gnss_validation_half_interval_seconds = "10.0"
+bag_name = Path(bag_folder).name
+results_folder = Path("results") / (
+    f"{bag_name}_{timestamp_start_seconds:g}s_to_{timestamp_end_seconds:g}s"
+)
+results_folder.mkdir(parents=True, exist_ok=True)
+log_file = (results_folder / "run.log").open("w", encoding="utf-8")
+atexit.register(log_file.close)
+for timestamp_seconds in range(
+    timestamp_start_seconds,
+    timestamp_end_seconds + 1,
+    timestamp_step_seconds,
+):  # process one output image per second
+    if timestamp_seconds != timestamp_start_seconds:
+        log_print("-" * 80)
+    timestamp_seconds = f"{timestamp_seconds:.1f}"
     window_duration_seconds = "0.5"  #  [s]
     time_base = "relative"
-    save_path = "results/"+ (timestamp_seconds.replace(".", "_") + ".png")
-    show_plot = True
-    print(f"Processing timestamp: {timestamp_seconds}")
+    save_path = str(results_folder / (timestamp_seconds.replace(".", "_") + ".png"))
+    show_plot = False
+    log_print(f"Processing timestamp: {timestamp_seconds}")
 
     # Parameters for start point detection
     start_point_min_neighbors = 5   # adapt this when changing the window size
     start_point_neighbor_radius = 0.25  # radius to search for neighboring points when detecting start points
     margin_end_of_row = 2.0  # margin around original EoR to look for SoR
     max_end_of_row_extension_distance = 10.0  # how far do we extrapolate the end of row points?
-    margin_fov_distance = 0.5   # how close to FoV edge can we detect a start of vine?   
+    segment_fov_distance = 1.0  # exclude a segment if any point is this close to an FOV boundary
+    margin_fov_distance = 1.0   # minimum start distance from an FOV boundary
     lidar_fov_angle_deg = 120.0  # total horizontal field of view, centered on GNSS heading
     retained_percentile = 0.99  # percentile of points to retain after RANSAC fitting
     downsample_fitting = True
@@ -1079,7 +1154,7 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
     max_RANSAC_trials = 2
 
     start_point_max_end_of_row_distance = margin_end_of_row  # how far away a start point can be from the nearest end-of-row point
-    max_distance_after_end_of_row = margin_end_of_row # maximum allowed distance that the pointcloud can go onto the headland
+    max_distance_after_end_of_row = 0.5 # maximum allowed distance that the pointcloud can go onto the headland
 
     ##########################################################################################
     ################################### START OF ALGORITHM #####################################
@@ -1089,11 +1164,33 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
     clouds, frame, times, bag_start_ns, lower, upper = load_cloud_window(
         bag_folder, timestamp_nanoseconds(timestamp_seconds), window_ns, time_base
     )
-    poses, pose_times = load_gnss_window(bag_folder, lower, upper)
+    if enable_chassis_exclusion:
+        if frame != "rearAxle":
+            raise ValueError(
+                f"Chassis exclusion requires rearAxle-frame clouds, got {frame!r}."
+            )
+        clouds = [
+            exclude_chassis_points(
+                cloud,
+                chassis_exclusion_x_min,
+                chassis_exclusion_x_max,
+                chassis_exclusion_y_min,
+                chassis_exclusion_y_max,
+            )
+            for cloud in clouds
+        ]
+    # Include earlier poses so the first cloud in the selected window can use
+    # the latest pose strictly before its recording timestamp.
+    poses, pose_times = load_gnss_window(bag_folder, bag_start_ns, upper)
+    gnss_path_start_ns = max(
+        bag_start_ns,
+        upper - timestamp_nanoseconds(gnss_validation_half_interval_seconds),
+    )
+    gnss_path_end_ns = upper + timestamp_nanoseconds(gnss_validation_half_interval_seconds)
     gnss_path_poses, gnss_path_times = load_gnss_window(
         bag_folder,
-        bag_start_ns + timestamp_nanoseconds("40"),
-        bag_start_ns + timestamp_nanoseconds("50"),
+        gnss_path_start_ns,
+        gnss_path_end_ns,
     )
     gnss_path = np.asarray([
         [pose.transform.translation.x, pose.transform.translation.y]
@@ -1111,17 +1208,21 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
         raise ValueError("GNSS forward axis cannot be projected onto the XY plot.")
     gnss_heading = float(np.arctan2(forward[1], forward[0]))
     result = process_world_cloud(xyz, gnss, ends, orientations, gnss_heading)
-    print(f"Point clouds: {len(clouds)}; segments: {len(result['segments'])}; "
+    log_print(f"Point clouds: {len(clouds)}; segments: {len(result['segments'])}; "
         f"starts: {len(result['segment_starts'])}")
-    print(f"Maximum cloud-to-GNSS offset: "
+    log_print(f"Maximum cloud-to-GNSS offset: "
         f"{np.max(np.asarray(times) - selected_times) / NANOSECONDS:.3f} s")
     for index, point, neighbors, density in result["segment_starts"]:
-        print(f"Segment {index} start: {point}; neighbors: {neighbors}; density passed: {density}")
+        log_print(f"Segment {index} start: {point}; neighbors: {neighbors}; density passed: {density}")
+    path_start_points = result["path_start_points"]
+    log_print(f"Path entrances: {len(path_start_points)}")
+    for index, point in enumerate(path_start_points):
+        log_print(f"Path entrance {index}: {point}")
     transform = result["start_midpoint_transform"]
     if transform is not None:
-        print("Start-to-midpoint XY transform:")
-        print(transform["matrix"])
-        print(f"Heading: {transform['heading_error_deg']:+.3f} deg; "
+        log_print("Start-to-midpoint XY transform:")
+        log_print(transform["matrix"])
+        log_print(f"Heading: {transform['heading_error_deg']:+.3f} deg; "
             f"X: {transform['x_error_m']:+.3f} m; Y: {transform['y_error_m']:+.3f} m; "
             f"RMSE: {transform['rmse']:.3f} m")
     transformed_ends = result["transformed_end_of_row_xyz"]
@@ -1138,12 +1239,33 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
         nearest_path_time_s = (
             gnss_path_times[nearest_path_index] - bag_start_ns
         ) / NANOSECONDS
-        print(f"Minimum GNSS-path-to-transformed-end-of-row distance: "
+        log_print(f"Minimum GNSS-path-to-transformed-end-of-row distance: "
             f"{minimum_error_m:.3f} m at t={nearest_path_time_s:.3f} s")
-        print(f"Nearest XY pair (GNSS -> transformed end-of-row): "
+        log_print(f"Nearest XY pair (GNSS -> transformed end-of-row): "
             f"{nearest_path_xy} -> {nearest_transformed_end_xy}")
     else:
-        print("Minimum GNSS-path-to-transformed-end-of-row distance unavailable.")
+        log_print("Minimum GNSS-path-to-transformed-end-of-row distance unavailable.")
+    minimum_path_entrance_error_m = None
+    nearest_gnss_to_path_xy = None
+    nearest_path_entrance_xy = None
+    if len(path_start_points) and len(gnss_path):
+        distances, nearest_entrance_indices = cKDTree(
+            path_start_points[:, :2]
+        ).query(gnss_path[:, :2])
+        nearest_gnss_index = int(np.argmin(distances))
+        nearest_entrance_index = int(nearest_entrance_indices[nearest_gnss_index])
+        minimum_path_entrance_error_m = float(distances[nearest_gnss_index])
+        nearest_gnss_to_path_xy = gnss_path[nearest_gnss_index, :2]
+        nearest_path_entrance_xy = path_start_points[nearest_entrance_index, :2]
+        nearest_path_time_s = (
+            gnss_path_times[nearest_gnss_index] - bag_start_ns
+        ) / NANOSECONDS
+        log_print(f"Minimum GNSS-path-to-path-entrance distance: "
+            f"{minimum_path_entrance_error_m:.3f} m at t={nearest_path_time_s:.3f} s")
+        log_print(f"Nearest XY pair (GNSS -> path entrance): "
+            f"{nearest_gnss_to_path_xy} -> {nearest_path_entrance_xy}")
+    else:
+        log_print("Minimum GNSS-path-to-path-entrance distance unavailable.")
 
 
     ##########################################################################################
@@ -1185,10 +1307,9 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
     axes.set_xlim(gnss.x - 15.0 - 0.0, gnss.x + 15.0 - 0.0)
     axes.set_ylim(gnss.y - 15.0 - 10.0, gnss.y + 15.0 - 10.0)
 
-    axes.plot(
-        gnss_path[:, 0], gnss_path[:, 1], color="white", linewidth=1.5,
-        zorder=7, label="GNSS path (40-50 s)",
-    )
+    # Keep the GNSS path available for diagnostics, but do not draw it on the
+    # point-cloud plot. The path may cover a different time window than the
+    # selected cloud and unnecessarily expand the plot limits.
     if minimum_error_m is not None:
         axes.plot(
             [nearest_path_xy[0], nearest_transformed_end_xy[0]],
@@ -1196,15 +1317,6 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
             color="gold", linestyle=":", linewidth=2, zorder=9,
             label=f"Minimum separation: {minimum_error_m:.2f} m",
         )
-    x_limits, y_limits = axes.get_xlim(), axes.get_ylim()
-    axes.set_xlim(
-        min(x_limits[0], gnss_path[:, 0].min() - 1.0),
-        max(x_limits[1], gnss_path[:, 0].max() + 1.0),
-    )
-    axes.set_ylim(
-        min(y_limits[0], gnss_path[:, 1].min() - 1.0),
-        max(y_limits[1], gnss_path[:, 1].max() + 1.0),
-    )
 
     # GNSS and LiDAR origin plot
     gnss = result["gnss_position"]
@@ -1236,7 +1348,8 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
         )
     axes.legend(loc="upper right", fontsize=8)
 
-    plt.show()
+    if show_plot:
+        plt.show()
 
     #%%
     # LiDAR field of view geometry
@@ -1341,6 +1454,27 @@ for timestamp_seconds in [44.0]:# np.arange(38, 47, 0.1):#  pick a time to compu
             for index, point, _, _ in selected:
                 axes.annotate(str(index), point[:2], xytext=(5, 5),
                             textcoords="offset points", color=color, zorder=7)
+    axes.legend(loc="upper right", fontsize=8)
+
+    if len(path_start_points):
+        axes.scatter(
+            path_start_points[:, 0], path_start_points[:, 1],
+            marker="D", s=85, color="deepskyblue", edgecolors="black",
+            zorder=7, label="LiDAR path entrances",
+        )
+        for index, point in enumerate(path_start_points):
+            axes.annotate(
+                f"P{index}", point[:2], xytext=(5, -12),
+                textcoords="offset points", color="deepskyblue", zorder=8,
+            )
+    if nearest_gnss_to_path_xy is not None:
+        axes.plot(
+            [nearest_gnss_to_path_xy[0], nearest_path_entrance_xy[0]],
+            [nearest_gnss_to_path_xy[1], nearest_path_entrance_xy[1]],
+            color="deepskyblue", linestyle=":", linewidth=2, zorder=9,
+            label=f"Minimum GNSS-path-to-path-entrance: "
+                  f"{minimum_path_entrance_error_m:.2f} m",
+        )
     axes.legend(loc="upper right", fontsize=8)
 
   
